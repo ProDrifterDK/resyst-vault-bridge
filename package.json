@@ -16,6 +16,7 @@
     ]
   },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
     "typecheck": "tsc --noEmit",
