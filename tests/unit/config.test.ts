@@ -6,7 +6,7 @@
  * so the real vault and the real home are never touched.
  */
 import { describe, expect, expectTypeOf, it } from "vitest";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -21,6 +21,7 @@ import {
   type ConfigFs,
 } from "../../src/config.js";
 import type { HostId } from "../../src/types.js";
+import type { VaultRootIdentity } from "../../src/paths.js";
 import {
   createVault,
   DEFAULT_LAYOUT,
@@ -140,7 +141,7 @@ describe("loadConfig: portable/local merge", () => {
       expect(cfg.project_overrides).toEqual([
         { path: "/home/tester/atlas", project_id: "atlas" },
       ]);
-      expect(cfg.vault_real_path).toBe(await realpath(vaultPath));
+      expect(cfg.vault_identity.real_path).toBe(await realpath(vaultPath));
     });
   });
 
@@ -1476,6 +1477,45 @@ describe("loadConfig: layout realpath containment", () => {
       }
       expect(caught).toBeInstanceOf(ConfigError);
       expect((caught as ConfigError).code).toBe("layout_escape");
+    });
+  });
+});
+
+describe("loadConfig: validated vault root identity", () => {
+  it("captures the exact dev/ino identity of the validated vault root", async () => {
+    await withVault(async (ctx) => {
+      await writeLocalConfig(ctx, { version: 1, host_id: "workstation", vault_path: ctx.vault.vaultPath });
+      const cfg = await load(ctx);
+      const rootStat = await stat(ctx.vault.vaultPath);
+      expect(cfg.vault_identity).toEqual({
+        real_path: await realpath(ctx.vault.vaultPath),
+        dev: rootStat.dev,
+        ino: rootStat.ino,
+      });
+      expectTypeOf(cfg.vault_identity).toEqualTypeOf<VaultRootIdentity>();
+      expectTypeOf(cfg.vault_identity.real_path).toEqualTypeOf<string>();
+      expectTypeOf(cfg.vault_identity.dev).toEqualTypeOf<number>();
+      expectTypeOf(cfg.vault_identity.ino).toEqualTypeOf<number>();
+    });
+  });
+
+  it("maps identity-capture failures to fixed redacted vault errors", async () => {
+    await withVault(async (ctx) => {
+      const { vaultPath } = ctx.vault;
+      await writeLocalConfig(ctx, { version: 1, host_id: "workstation", vault_path: vaultPath });
+      const fs = failingConfigFs(
+        (method, filePath) => method === "stat" && filePath === vaultPath,
+        "EIO",
+      );
+      let caught: unknown;
+      try {
+        await loadConfig({ xdgConfigHome: ctx.xdg, home: ctx.home, fs });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ConfigError);
+      expect((caught as ConfigError).code).toBe("vault_unreadable");
+      expect((caught as ConfigError).message).not.toContain(vaultPath);
     });
   });
 });

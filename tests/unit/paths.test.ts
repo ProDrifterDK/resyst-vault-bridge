@@ -9,7 +9,7 @@
  */
 import { describe, expect, expectTypeOf, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -17,6 +17,7 @@ import {
   VaultPathError,
   VaultPaths,
   type ResolvedVaultPath,
+  type VaultRootIdentity,
   type VaultPathsFs,
 } from "../../src/paths.js";
 import type { VaultPath } from "../../src/types.js";
@@ -26,10 +27,19 @@ interface PathsContext {
   root: string;
   vault: CreatedVault;
   paths: VaultPaths;
+  /** Config-validated identity of the fixture vault (captured at setup). */
+  identity: VaultRootIdentity;
   /** Absolute path of a file outside the vault, for escape fixtures. */
   outsideFile: string;
   /** Absolute path of a directory outside the vault, for escape fixtures. */
   outsideDir: string;
+}
+
+/** Capture the config-style identity of a vault root (realpath + dev/ino). */
+async function vaultIdentityOf(vaultPath: string): Promise<VaultRootIdentity> {
+  const real = await realpath(vaultPath);
+  const rootStat = await stat(vaultPath);
+  return { real_path: real, dev: rootStat.dev, ino: rootStat.ino };
 }
 
 async function withPaths<T>(
@@ -42,11 +52,13 @@ async function withPaths<T>(
     await writeFile(outsideFile, "# outside\n", "utf8");
     const outsideDir = path.join(root, "outside-dir");
     await mkdir(outsideDir);
+    const identity = await vaultIdentityOf(vault.vaultPath);
     const paths = new VaultPaths(vault.vaultPath, {
+      identity,
       attachmentsDir: vault.layout.attachmentsDir,
       fs: nodeVaultPathsFs,
     });
-    return await body({ root, vault, paths, outsideFile, outsideDir });
+    return await body({ root, vault, paths, identity, outsideFile, outsideDir });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -442,7 +454,7 @@ describe("VaultPaths: filesystem failures are redacted", () => {
           (method, filePath) => method === "realpath" && filePath === ctx.vault.vaultPath,
           code,
         );
-        const paths = new VaultPaths(ctx.vault.vaultPath, { fs });
+        const paths = new VaultPaths(ctx.vault.vaultPath, { identity: ctx.identity, fs });
         const readErr = await capture(() => paths.resolveRead("CLAUDE.md"));
         expect(readErr, code).toBeDefined();
         expect(readErr?.code, code).toBe("io_error");
@@ -478,7 +490,7 @@ describe("VaultPaths: filesystem failures are redacted", () => {
         ];
         for (const seam of seams) {
           const fs = failingPathsFs(seam.failWhen, code);
-          const paths = new VaultPaths(ctx.vault.vaultPath, { fs });
+          const paths = new VaultPaths(ctx.vault.vaultPath, { identity: ctx.identity, fs });
           const err = await capture(() => paths.resolveRead("Proyectos/Atlas.md"));
           expect(err, `${code}:${seam.label}`).toBeDefined();
           expect(err?.code, `${code}:${seam.label}`).toBe("io_error");
@@ -517,7 +529,7 @@ describe("VaultPaths: filesystem failures are redacted", () => {
         ];
         for (const seam of seams) {
           const fs = failingPathsFs(seam.failWhen, code);
-          const paths = new VaultPaths(ctx.vault.vaultPath, { fs });
+          const paths = new VaultPaths(ctx.vault.vaultPath, { identity: ctx.identity, fs });
           const err = await capture(() => paths.resolveWrite(seam.target));
           expect(err, `${code}:${seam.label}`).toBeDefined();
           expect(err?.code, `${code}:${seam.label}`).toBe("io_error");
@@ -533,7 +545,7 @@ describe("VaultPaths: filesystem failures are redacted", () => {
         (method, filePath) => method === "lstat" && filePath === ctx.vault.absolute("CLAUDE.md"),
         "EACCES",
       );
-      const paths = new VaultPaths(ctx.vault.vaultPath, { fs });
+      const paths = new VaultPaths(ctx.vault.vaultPath, { identity: ctx.identity, fs });
       const err = await capture(() => paths.resolveRead("CLAUDE.md"));
       expect(err).toBeDefined();
       expect(JSON.stringify(err)).not.toContain(ctx.vault.vaultPath);
@@ -548,7 +560,7 @@ describe("VaultPaths: non-regular write targets", () => {
     await withPaths(async (ctx) => {
       const targetAbs = ctx.vault.absolute("Proyectos/pipe.md");
       const { fs, realpathCalls } = nonRegularTargetFs(targetAbs);
-      const paths = new VaultPaths(ctx.vault.vaultPath, { fs });
+      const paths = new VaultPaths(ctx.vault.vaultPath, { identity: ctx.identity, fs });
       const err = await capture(() => paths.resolveWrite("Proyectos/pipe.md"));
       expect(err).toBeDefined();
       expect(err?.code).toBe("target_not_file");
@@ -587,7 +599,7 @@ describe("VaultPaths: pinned vault root identity", () => {
     await withPaths(async (ctx) => {
       const link = path.join(ctx.root, "vault-link");
       await symlink(ctx.vault.vaultPath, link);
-      const paths = new VaultPaths(link, { fs: nodeVaultPathsFs });
+      const paths = new VaultPaths(link, { identity: ctx.identity, fs: nodeVaultPathsFs });
       // First call pins the initial identity through the link.
       const first = await paths.resolveRead("CLAUDE.md");
       expect(first.absolute).toBe(path.join(link, "CLAUDE.md"));
@@ -607,7 +619,7 @@ describe("VaultPaths: pinned vault root identity", () => {
     await withPaths(async (ctx) => {
       const link = path.join(ctx.root, "vault-link");
       await symlink(ctx.vault.vaultPath, link);
-      const paths = new VaultPaths(link, { fs: nodeVaultPathsFs });
+      const paths = new VaultPaths(link, { identity: ctx.identity, fs: nodeVaultPathsFs });
       await paths.resolveRead("CLAUDE.md");
       await rm(link);
       await symlink(ctx.outsideDir, link);
@@ -619,7 +631,7 @@ describe("VaultPaths: pinned vault root identity", () => {
 
   it("rejects a root-level write after the vault root is renamed away", async () => {
     await withPaths(async (ctx) => {
-      const paths = new VaultPaths(ctx.vault.vaultPath, { fs: nodeVaultPathsFs });
+      const paths = new VaultPaths(ctx.vault.vaultPath, { identity: ctx.identity, fs: nodeVaultPathsFs });
       await paths.resolveWrite("note.md");
       const moved = path.join(ctx.root, "vault-moved");
       await rename(ctx.vault.vaultPath, moved);
@@ -634,7 +646,7 @@ describe("VaultPaths: pinned vault root identity", () => {
 
   it("rejects a root-level write after the vault root is replaced by an outside symlink", async () => {
     await withPaths(async (ctx) => {
-      const paths = new VaultPaths(ctx.vault.vaultPath, { fs: nodeVaultPathsFs });
+      const paths = new VaultPaths(ctx.vault.vaultPath, { identity: ctx.identity, fs: nodeVaultPathsFs });
       await paths.resolveWrite("note.md");
       await rm(ctx.vault.vaultPath, { recursive: true, force: true });
       await symlink(ctx.outsideDir, ctx.vault.vaultPath);
@@ -646,7 +658,7 @@ describe("VaultPaths: pinned vault root identity", () => {
 
   it("rejects a root-level write after the vault root directory is replaced at the same pathname", async () => {
     await withPaths(async (ctx) => {
-      const paths = new VaultPaths(ctx.vault.vaultPath, { fs: nodeVaultPathsFs });
+      const paths = new VaultPaths(ctx.vault.vaultPath, { identity: ctx.identity, fs: nodeVaultPathsFs });
       await paths.resolveWrite("note.md");
       // Renaming the vault away and recreating a brand-new directory at the
       // same pathname keeps the same realpath string. The old inode stays
@@ -679,11 +691,60 @@ describe("VaultPaths: pinned vault root identity", () => {
     await withPaths(async (ctx) => {
       const link = path.join(ctx.root, "vault-link");
       await symlink(ctx.vault.vaultPath, link);
-      const paths = new VaultPaths(link, { fs: nodeVaultPathsFs });
+      const paths = new VaultPaths(link, { identity: ctx.identity, fs: nodeVaultPathsFs });
       await paths.resolveRead("CLAUDE.md");
       await rm(link);
       await symlink(ctx.outsideDir, link);
       const err = await capture(() => paths.resolveWrite("Proyectos/New.md"));
+      expect(err).toBeDefined();
+      expect(err?.code).toBe("symlink_escape");
+    });
+  });
+});
+
+describe("VaultPaths: config-trusted root identity (no trust-on-first-use)", () => {
+  it("rejects a root replaced at the same pathname before the first resolve", async () => {
+    await withPaths(async (ctx) => {
+      // The original vault is moved away and a brand-new directory appears at
+      // the same pathname before any resolve. Only a config-validated pinned
+      // identity can reject this; trust-on-first-use would bless the
+      // replacement as the new root.
+      const moved = path.join(ctx.root, "vault-moved");
+      await rename(ctx.vault.vaultPath, moved);
+      await mkdir(ctx.vault.vaultPath);
+      const paths = new VaultPaths(ctx.vault.vaultPath, { identity: ctx.identity, fs: nodeVaultPathsFs });
+      const err = await capture(() => paths.resolveWrite("note.md"));
+      expect(err).toBeDefined();
+      expect(err?.code).toBe("symlink_escape");
+      const readErr = await capture(() => paths.resolveRead("CLAUDE.md"));
+      expect(readErr).toBeDefined();
+      expect(readErr?.code).toBe("symlink_escape");
+    });
+  });
+
+  it("rejects a symlink root retargeted outside before the first resolve", async () => {
+    await withPaths(async (ctx) => {
+      const link = path.join(ctx.root, "vault-link");
+      await symlink(ctx.vault.vaultPath, link);
+      // Retarget the link to an outside directory before any resolve.
+      await rm(link);
+      await symlink(ctx.outsideDir, link);
+      const paths = new VaultPaths(link, { identity: ctx.identity, fs: nodeVaultPathsFs });
+      const err = await capture(() => paths.resolveWrite("note.md"));
+      expect(err).toBeDefined();
+      expect(err?.code).toBe("symlink_escape");
+    });
+  });
+
+  it("rejects a symlink root replaced by a real directory before the first resolve", async () => {
+    await withPaths(async (ctx) => {
+      const link = path.join(ctx.root, "vault-link");
+      await symlink(ctx.vault.vaultPath, link);
+      // Replace the link with an unrelated real directory before any resolve.
+      await rm(link);
+      await mkdir(link);
+      const paths = new VaultPaths(link, { identity: ctx.identity, fs: nodeVaultPathsFs });
+      const err = await capture(() => paths.resolveWrite("note.md"));
       expect(err).toBeDefined();
       expect(err?.code).toBe("symlink_escape");
     });

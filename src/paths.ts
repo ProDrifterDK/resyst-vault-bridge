@@ -168,34 +168,52 @@ function lexicalSegments(
 
 /**
  * The containment boundary shared by every read and write path. Construct
- * with the configured vault root (already validated by the config layer).
- * The root's real path plus dev/ino identity is pinned on first use and
- * re-established on every resolve; a retargeted symlink, renamed-away root,
- * or same-pathname replacement is rejected as `symlink_escape` (or
- * `io_error` when the current identity cannot be established). Every
- * resolved note must stay inside the pinned real root.
+ * with the configured vault root and the config-validated
+ * {@link VaultRootIdentity} (from `loadConfig`); there is no trust-on-
+ * first-use fallback. The current root identity (realpath + dev/ino) is
+ * re-established on every resolve — including the first — and must match the
+ * trusted identity; a retargeted symlink, renamed-away root, or same-
+ * pathname replacement is rejected as `symlink_escape` (or `io_error` when
+ * the current identity cannot be established). Every resolved note must stay
+ * inside the trusted real root.
  */
-/** Pinned vault root identity: the initially resolved real path plus dev/ino. */
-interface RootIdentity {
-  real: string;
+/**
+ * Config-validated vault root identity. Produced by `loadConfig` after vault
+ * validation and REQUIRED by {@link VaultPaths} at construction; VaultPaths
+ * never trusts whatever the filesystem shows on first use.
+ */
+export interface VaultRootIdentity {
+  /** Symlink-resolved absolute vault root path. */
+  real_path: string;
+  /** Device number of the resolved root directory (Node `Stats.dev`). */
   dev: number;
+  /** Inode number of the resolved root directory (Node `Stats.ino`). */
   ino: number;
+}
+
+/** Options for {@link VaultPaths}. The trusted identity is required. */
+export interface VaultPathsOptions {
+  /**
+   * Config-validated vault root identity; there is no overload or optional
+   * path that silently trusts first use.
+   */
+  identity: VaultRootIdentity;
+  attachmentsDir?: string;
+  fs?: VaultPathsFs;
 }
 
 export class VaultPaths {
   readonly vaultRoot: string;
   readonly attachmentsDir: string;
   private readonly fs: VaultPathsFs;
-  /** Initially pinned root identity; re-verified on every resolve. */
-  private pinnedIdentity: RootIdentity | undefined;
+  /** Trusted identity established by config validation; never first-use. */
+  private readonly trustedIdentity: VaultRootIdentity;
 
-  constructor(
-    vaultRoot: string,
-    options: { attachmentsDir?: string; fs?: VaultPathsFs } = {},
-  ) {
+  constructor(vaultRoot: string, options: VaultPathsOptions) {
     this.vaultRoot = vaultRoot;
     this.attachmentsDir = options.attachmentsDir ?? DEFAULT_ATTACHMENTS_DIR;
     this.fs = options.fs ?? nodeVaultPathsFs;
+    this.trustedIdentity = options.identity;
   }
 
   /**
@@ -204,7 +222,7 @@ export class VaultPaths {
    * EIO) surface as the fixed redacted `io_error`; a root that is no longer a
    * directory cannot establish the vault identity.
    */
-  private async currentRootIdentity(): Promise<RootIdentity> {
+  private async currentRootIdentity(): Promise<VaultRootIdentity> {
     let real: string;
     try {
       real = await this.fs.realpath(this.vaultRoot);
@@ -220,30 +238,26 @@ export class VaultPaths {
     if (!rootStat.isDirectory()) {
       throw new VaultPathError("symlink_escape");
     }
-    return { real, dev: rootStat.dev, ino: rootStat.ino };
+    return { real_path: real, dev: rootStat.dev, ino: rootStat.ino };
   }
 
   /**
-   * Re-establish the current root identity on every resolve and compare it to
-   * the initially pinned identity. A retargeted symlink, renamed-away root,
-   * or same-pathname replacement changes the realpath or the dev/ino and is
-   * rejected with `symlink_escape`; the replacement is never blessed as the
-   * new trusted root.
+   * Re-establish the current root identity on every resolve — including the
+   * first — and compare it to the config-validated trusted identity. A
+   * retargeted symlink, renamed-away root, or same-pathname replacement
+   * changes the realpath or the dev/ino and is rejected with
+   * `symlink_escape`; the replacement is never blessed as the trusted root.
    */
   private async verifiedVaultReal(): Promise<string> {
-    if (this.pinnedIdentity === undefined) {
-      this.pinnedIdentity = await this.currentRootIdentity();
-      return this.pinnedIdentity.real;
-    }
     const current = await this.currentRootIdentity();
     if (
-      current.real !== this.pinnedIdentity.real ||
-      current.dev !== this.pinnedIdentity.dev ||
-      current.ino !== this.pinnedIdentity.ino
+      current.real_path !== this.trustedIdentity.real_path ||
+      current.dev !== this.trustedIdentity.dev ||
+      current.ino !== this.trustedIdentity.ino
     ) {
       throw new VaultPathError("symlink_escape");
     }
-    return this.pinnedIdentity.real;
+    return this.trustedIdentity.real_path;
   }
 
   private isWithin(realPath: string, vaultReal: string): boolean {

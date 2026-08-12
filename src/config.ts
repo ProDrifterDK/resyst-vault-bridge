@@ -34,6 +34,7 @@ import { Type, type StaticDecode, type TSchema } from "typebox";
 import { Value } from "typebox/value";
 import { parse as parseYaml } from "yaml";
 import { HostIdSchema, ProjectIdSchema, VAULT_PATH_PATTERN } from "./schemas.js";
+import type { VaultRootIdentity } from "./paths.js";
 import type { HostId, ProjectId } from "./types.js";
 
 /** Default context budget in estimated tokens when the portable config omits it. */
@@ -110,10 +111,18 @@ export class ConfigError extends Error {
   }
 }
 
+/** Directory/file shape plus filesystem identity from a stat call. */
+interface ConfigStat {
+  isDirectory(): boolean;
+  isFile(): boolean;
+  dev: number;
+  ino: number;
+}
+
 /** Minimal filesystem seam so tests never touch the real home or vault. */
 export interface ConfigFs {
   readFile(filePath: string): Promise<string>;
-  stat(filePath: string): Promise<{ isDirectory(): boolean; isFile(): boolean }>;
+  stat(filePath: string): Promise<ConfigStat>;
   realpath(filePath: string): Promise<string>;
 }
 
@@ -123,6 +132,8 @@ export const nodeConfigFs: ConfigFs = {
   stat,
   realpath,
 };
+
+export type { VaultRootIdentity } from "./paths.js";
 
 /** Injection points for deterministic tests. */
 export interface LoadConfigDeps {
@@ -188,8 +199,12 @@ export interface BridgeConfig {
   host_id: HostId;
   /** Absolute vault path exactly as configured locally. */
   vault_path: string;
-  /** Symlink-resolved vault path; the containment root for path checks. */
-  vault_real_path: string;
+  /**
+   * Config-validated vault root identity (resolved real path + dev/ino).
+   * The single source of truth for the containment root; `VaultPaths`
+   * requires it at construction and re-verifies it on every resolve.
+   */
+  vault_identity: VaultRootIdentity;
   layout: PortableConfig["layout"];
   templates: PortableConfig["templates"];
   managed_headings: PortableConfig["managed_headings"];
@@ -546,6 +561,23 @@ export async function loadConfig(deps: LoadConfigDeps = {}): Promise<BridgeConfi
   } catch {
     throw new ConfigError("vault_unreadable");
   }
+  // Capture one cohesive identity from the resolved real path: realpath plus
+  // the dev/ino of the resolved directory. Failure to establish any part of
+  // the identity is a fixed redacted vault error.
+  let vaultIdentityStat: ConfigStat;
+  try {
+    vaultIdentityStat = await fs.stat(vaultReal);
+  } catch {
+    throw new ConfigError("vault_unreadable");
+  }
+  if (!vaultIdentityStat.isDirectory()) {
+    throw new ConfigError("vault_not_directory");
+  }
+  const vault_identity: VaultRootIdentity = {
+    real_path: vaultReal,
+    dev: vaultIdentityStat.dev,
+    ino: vaultIdentityStat.ino,
+  };
 
   const portableFile = path.join(local.vault_path, ".resyst", "agent-vault.yaml");
   const portableRaw = await readOrAbsent(fs, portableFile, "portable_config_missing", "portable_config_unreadable");
@@ -596,7 +628,7 @@ export async function loadConfig(deps: LoadConfigDeps = {}): Promise<BridgeConfi
     version: 1,
     host_id: local.host_id,
     vault_path: local.vault_path,
-    vault_real_path: vaultReal,
+    vault_identity,
     layout: portable.layout,
     templates: portable.templates,
     managed_headings: portable.managed_headings,
@@ -629,7 +661,7 @@ async function statOrError(
   filePath: string,
   absentCode: ConfigErrorCode,
   unreadableCode: ConfigErrorCode,
-): Promise<{ isDirectory(): boolean; isFile(): boolean }> {
+): Promise<ConfigStat> {
   try {
     return await fs.stat(filePath);
   } catch (error) {
