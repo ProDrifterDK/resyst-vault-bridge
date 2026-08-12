@@ -22,9 +22,11 @@ import {
   replaceManagedBlock,
   type FrontmatterResult,
   type HeadingLookupResult,
+  type ManagedBlock,
   type ManagedInsertResult,
   type ManagedReplaceResult,
   type ParsedNote,
+  type ResystProjectMetadata,
   type SectionLookupResult,
 } from "../../src/markdown.js";
 
@@ -61,7 +63,12 @@ describe("parseNote frontmatter", () => {
       "aliases:",
       '  - "Alias Uno"',
       '  - "Alias Dos"',
-      'resyst_project: "atlas"',
+      "resyst_project:",
+      '  id: "atlas"',
+      "  repos:",
+      '    - "github.com/tester/atlas"',
+      "  aliases:",
+      '    - "Atlas"',
       "---",
       "# Nota",
       "",
@@ -74,12 +81,16 @@ describe("parseNote frontmatter", () => {
         date: "2026-08-11",
         tags: ["alfa", "beta"],
         aliases: ["Alias Uno", "Alias Dos"],
-        resyst_project: "atlas",
+        resyst_project: {
+          id: "atlas",
+          repos: ["github.com/tester/atlas"],
+          aliases: ["Atlas"],
+        },
       });
       // The frontmatter region carries exact source offsets.
       expect(note.frontmatter.start).toBe(0);
       expect(source.slice(note.frontmatter.start, note.frontmatter.end)).toBe(
-        "---\ntitle: \"Tareas & Notas\"\ndate: \"2026-08-11\"\ntags:\n  - \"alfa\"\n  - \"beta\"\naliases:\n  - \"Alias Uno\"\n  - \"Alias Dos\"\nresyst_project: \"atlas\"\n---\n",
+        "---\ntitle: \"Tareas & Notas\"\ndate: \"2026-08-11\"\ntags:\n  - \"alfa\"\n  - \"beta\"\naliases:\n  - \"Alias Uno\"\n  - \"Alias Dos\"\nresyst_project:\n  id: \"atlas\"\n  repos:\n    - \"github.com/tester/atlas\"\n  aliases:\n    - \"Atlas\"\n---\n",
       );
     }
   });
@@ -458,24 +469,27 @@ describe("extractSection", () => {
 describe("replaceManagedBlock preservation", () => {
   it("replaces only the bounded body; prefix and suffix stay byte-identical", () => {
     const source = blockSource("- hecho\n- pendiente");
-    const result = replaceManagedBlock(source, "sess-01ab", "daily", "- hecho\n- nuevo\n- más");
+    const note = parse(source);
+    expect(note.managed.kind).toBe("ok");
+    const old = note.managed.kind === "ok" ? note.managed.blocks[0] : undefined;
+    const result = replaceManagedBlock(
+      source,
+      "sess-01ab",
+      "daily",
+      "- hecho\n- nuevo\n- más",
+    );
     expect(result.kind).toBe("replaced");
-    if (result.kind === "replaced") {
-      const block = result.block;
-      const expected =
-        source.slice(0, block.body_start) +
-        "- hecho\n- nuevo\n- más\n" +
-        source.slice(block.body_end);
-      expect(result.source).toBe(expected);
-      // Prefix/suffix byte-identical, only the body range differs.
-      expect(result.source.slice(0, block.body_start)).toBe(
-        source.slice(0, block.body_start),
-      );
-      // The suffix starts after the *new* body; its bytes are the original
-      // suffix unchanged.
+    if (result.kind === "replaced" && old) {
       const newBody = "- hecho\n- nuevo\n- más\n";
-      expect(result.source.slice(block.body_start + newBody.length)).toBe(
-        source.slice(block.body_end),
+      // Only the bounded body range differs; prefix/suffix byte-identical.
+      expect(result.source).toBe(
+        source.slice(0, old.body_start) + newBody + source.slice(old.body_end),
+      );
+      expect(result.source.slice(0, result.block.body_start)).toBe(
+        source.slice(0, old.body_start),
+      );
+      expect(result.source.slice(result.block.body_start + newBody.length)).toBe(
+        source.slice(old.body_end),
       );
       expect(result.source).not.toBe(source);
     }
@@ -656,5 +670,721 @@ describe("frontmatter typed results", () => {
       | { kind: "missing" }
       | { kind: "invalid" }
     >();
+  });
+});
+
+
+describe("frontmatter delimiter region with invalid YAML", () => {
+  it("skips heading-looking lines inside an invalid delimited frontmatter", () => {
+    const source = [
+      "---",
+      "title: [unclosed",
+      "## Tareas",
+      "---",
+      "# Real",
+      "",
+    ].join("\n");
+    const note = parse(source);
+    expect(note.frontmatter.kind).toBe("invalid");
+    expect(note.headings.map((h) => h.text)).toEqual(["Real"]);
+  });
+
+  it("skips wikilinks inside an invalid delimited frontmatter", () => {
+    const source = [
+      "---",
+      "title: [unclosed",
+      "[[Fake]]",
+      "---",
+      "[[Real]]",
+      "",
+    ].join("\n");
+    const note = parse(source);
+    expect(note.wikilinks.map((w) => w.target)).toEqual(["Real"]);
+  });
+
+  it("ignores managed markers inside an invalid delimited frontmatter", () => {
+    const source = [
+      "---",
+      "title: [unclosed",
+      "<!-- resyst-vault:begin session=a target=daily -->",
+      "<!-- resyst-vault:end session=a target=daily -->",
+      "---",
+      "# Nota",
+      "",
+    ].join("\n");
+    const note = parse(source);
+    expect(note.frontmatter.kind).toBe("invalid");
+    expect(note.managed.kind).toBe("ok");
+    if (note.managed.kind === "ok") {
+      expect(note.managed.blocks).toHaveLength(0);
+    }
+    // markers inside invalid frontmatter are data, not bridge markers, and
+    // the whole structurally invalid note fails closed for write operations
+    expect(replaceManagedBlock(source, "a", "daily", "x").kind).toBe(
+      "invalid_frontmatter",
+    );
+  });
+
+  it("preserves the exact region offsets of an invalid delimited frontmatter", () => {
+    const source = [
+      "---",
+      "title: [unclosed",
+      "---",
+      "# Real",
+      "",
+    ].join("\n");
+    const note = parse(source);
+    expect(note.frontmatter.kind).toBe("invalid");
+    if (note.frontmatter.kind === "invalid") {
+      expect(note.frontmatter.start).toBe(0);
+      expect(note.source.slice(note.frontmatter.start, note.frontmatter.end)).toBe(
+        "---\ntitle: [unclosed\n---\n",
+      );
+      expect(note.source.slice(note.frontmatter.body_start, note.frontmatter.body_end)).toBe(
+        "title: [unclosed\n",
+      );
+    }
+  });
+
+  it("ignores valid- and malformed-looking markers inside invalid YAML", () => {
+    const source = [
+      "---",
+      "title: [unclosed",
+      "<!-- resyst-vault:begin session=a target=daily -->",
+      "<!-- resyst-vault:end session=b target=daily -->",
+      "<!-- resyst-vault:begin session=broken -->",
+      "---",
+      "# Nota",
+      "",
+    ].join("\n");
+    const note = parse(source);
+    expect(note.frontmatter.kind).toBe("invalid");
+    // none of the marker text becomes a document construct
+    expect(note.managed.kind).toBe("ok");
+    if (note.managed.kind === "ok") {
+      expect(note.managed.blocks).toHaveLength(0);
+    }
+    expect(replaceManagedBlock(source, "a", "daily", "x").kind).toBe(
+      "invalid_frontmatter",
+    );
+    expect(
+      insertManagedBlock(source, "## Tareas", "sess-01ab", "daily", "x").kind,
+    ).toBe("invalid_frontmatter");
+  });
+
+  it("does not leak a fence-looking line inside invalid frontmatter", () => {
+    const source = [
+      "---",
+      "title: [unclosed",
+      "```",
+      "## Fake inside fence",
+      "```",
+      "---",
+      "# Real",
+      "",
+      "## Tareas",
+      "",
+    ].join("\n");
+    const note = parse(source);
+    expect(note.frontmatter.kind).toBe("invalid");
+    expect(note.headings.map((h) => h.text)).toEqual(["Real", "Tareas"]);
+  });
+
+  it("proves write operations cannot target headings inside invalid frontmatter", () => {
+    const source = [
+      "---",
+      "title: [unclosed",
+      "## Tareas",
+      "---",
+      "# Nota",
+      "",
+    ].join("\n");
+    expect(parse(source).frontmatter.kind).toBe("invalid");
+    expect(findHeading(source, "## Tareas").kind).toBe("missing");
+    expect(extractSection(source, "## Tareas").kind).toBe("missing");
+    // write operations fail closed on a structurally invalid note
+    expect(
+      insertManagedBlock(source, "## Tareas", "sess-01ab", "daily", "x").kind,
+    ).toBe("invalid_frontmatter");
+    expect(
+      replaceManagedBlock(source, "sess-01ab", "daily", "x").kind,
+    ).toBe("invalid_frontmatter");
+  });
+
+  it("keeps the unclosed-leading--- policy: content after it is scanned normally", () => {
+    // A leading `---` with no closing delimiter is a thematic break, so the
+    // following heading is live (the region policy is intentional).
+    const source = "---\n# Tareas\n\n## Tareas\n";
+    expect(parse(source).frontmatter.kind).toBe("missing");
+    expect(findHeading(source, "## Tareas").kind).toBe("found");
+  });
+});
+
+describe("resyst_project object metadata", () => {
+  /** Build a note whose frontmatter body is the given lines. */
+  function projectSource(body: string): string {
+    return `---\n${body}\n---\n# Nota\n`;
+  }
+
+  it("narrows the approved portable object with quoted values", () => {
+    const note = parse(
+      projectSource([
+        "resyst_project:",
+        '  id: "atlas"',
+        "  repos:",
+        '    - "github.com/tester/atlas"',
+        "  aliases:",
+        '    - "Atlas"',
+      ].join("\n")),
+    );
+    expect(note.frontmatter.kind).toBe("present");
+    if (note.frontmatter.kind === "present") {
+      expect(note.frontmatter.metadata.resyst_project).toEqual({
+        id: "atlas",
+        repos: ["github.com/tester/atlas"],
+        aliases: ["Atlas"],
+      });
+      expectTypeOf(note.frontmatter.metadata.resyst_project).toEqualTypeOf<
+        ResystProjectMetadata | null
+      >();
+      // the delimited region bytes are preserved exactly
+      expect(note.source.slice(note.frontmatter.start, note.frontmatter.end)).toBe(
+        `---\n${[
+          "resyst_project:",
+          '  id: "atlas"',
+          "  repos:",
+          '    - "github.com/tester/atlas"',
+          "  aliases:",
+          '    - "Atlas"',
+        ].join("\n")}\n---\n`,
+      );
+    }
+  });
+
+  it("does not copy unknown nested keys", () => {
+    const note = parse(
+      projectSource([
+        "resyst_project:",
+        "  id: atlas",
+        "  secret_token: hunter2",
+        "  repos:",
+        "    - github.com/tester/atlas",
+        "  aliases:",
+        "    - Atlas",
+      ].join("\n")),
+    );
+    expect(note.frontmatter.kind).toBe("present");
+    if (note.frontmatter.kind === "present") {
+      expect(note.frontmatter.metadata.resyst_project).toEqual({
+        id: "atlas",
+        repos: ["github.com/tester/atlas"],
+        aliases: ["Atlas"],
+      });
+    }
+  });
+
+  it("rejects malformed resyst_project values deterministically", () => {
+    const malformed: string[] = [
+      'resyst_project: "atlas"',
+      "resyst_project: 42",
+      "resyst_project:",
+      "resyst_project:\n  id: 42",
+      "resyst_project:\n  id: 'bad id!'",
+      "resyst_project:\n  id: '../escape'",
+      "resyst_project:\n  repos:\n    - github.com/tester/atlas",
+    ];
+    for (const body of malformed) {
+      const note = parse(projectSource(body));
+      expect(note.frontmatter.kind).toBe("present");
+      if (note.frontmatter.kind === "present") {
+        expect(note.frontmatter.metadata.resyst_project).toBeNull();
+      }
+    }
+  });
+
+  it("rejects the whole value when a present array is not a string array", () => {
+    // Mixed-type, empty-string, overlong, and scalar entries all reject the
+    // entire resyst_project value to null; partial metadata is never kept.
+    const malformed: string[] = [
+      "resyst_project:\n  id: atlas\n  repos:\n    - 7\n    - github.com/tester/atlas",
+      "resyst_project:\n  id: atlas\n  repos:\n    - \n    - github.com/tester/atlas",
+      "resyst_project:\n  id: atlas\n  repos: github.com/tester/atlas",
+      "resyst_project:\n  id: atlas\n  aliases: Atlas",
+      "resyst_project:\n  id: atlas\n  repos: { nested: map }",
+      "resyst_project:\n  id: atlas\n  repos: null",
+      "resyst_project:\n  id: atlas\n  aliases:",
+    ];
+    for (const body of malformed) {
+      const note = parse(projectSource(body));
+      expect(note.frontmatter.kind).toBe("present");
+      if (note.frontmatter.kind === "present") {
+        expect(note.frontmatter.metadata.resyst_project).toBeNull();
+      }
+    }
+  });
+
+  it("accepts id-only and empty-array metadata as exact output arrays", () => {
+    const idOnly = parse(
+      projectSource("resyst_project:\n  id: atlas"),
+    );
+    expect(idOnly.frontmatter.kind).toBe("present");
+    if (idOnly.frontmatter.kind === "present") {
+      expect(idOnly.frontmatter.metadata.resyst_project).toEqual({
+        id: "atlas",
+        repos: [],
+        aliases: [],
+      });
+    }
+    const emptyArrays = parse(
+      projectSource("resyst_project:\n  id: atlas\n  repos: []\n  aliases: []"),
+    );
+    expect(emptyArrays.frontmatter.kind).toBe("present");
+    if (emptyArrays.frontmatter.kind === "present") {
+      expect(emptyArrays.frontmatter.metadata.resyst_project).toEqual({
+        id: "atlas",
+        repos: [],
+        aliases: [],
+      });
+    }
+  });
+
+  it("bounds overlong strings and oversized lists by rejecting the value", () => {
+    const long = "r".repeat(2000);
+    const many = Array.from({ length: 70 }, (_, i) => `alias-${i}`);
+    for (const body of [
+      "resyst_project:\n  id: atlas\n  repos:\n    - " + long,
+      "resyst_project:\n  id: atlas\n  aliases:\n" + many.map((a) => `    - ${a}`).join("\n"),
+    ]) {
+      const note = parse(projectSource(body));
+      expect(note.frontmatter.kind).toBe("present");
+      if (note.frontmatter.kind === "present") {
+        expect(note.frontmatter.metadata.resyst_project).toBeNull();
+      }
+    }
+  });
+});
+
+describe("replaceManagedBlock returned offsets", () => {
+  const begin = "<!-- resyst-vault:begin session=sess-01ab target=daily -->";
+  const end = "<!-- resyst-vault:end session=sess-01ab target=daily -->";
+
+  /** Assert every offset/slice of a block is consistent with its source. */
+  function assertConsistent(
+    source: string,
+    block: ManagedBlock,
+    expectedBody: string,
+  ): void {
+    const eol = source.includes("\r\n") ? "\r\n" : "\n";
+    expect(source.slice(block.begin_start, block.begin_end)).toBe(begin);
+    expect(block.body_start).toBe(block.begin_end + eol.length);
+    expect(source.slice(block.body_start, block.body_end)).toBe(expectedBody);
+    expect(block.end_start).toBe(block.body_end);
+    expect(source.slice(block.end_start, block.end_end)).toBe(end);
+  }
+
+  function oldBlockOf(source: string): ManagedBlock {
+    const note = parse(source);
+    expect(note.managed.kind).toBe("ok");
+    if (note.managed.kind === "ok") {
+      return note.managed.blocks[0]!;
+    }
+    throw new Error("fixture must contain one managed block");
+  }
+
+  it("returns a block consistent with the new source for a shorter LF replacement", () => {
+    const source = blockSource("- hecho\n- pendiente");
+    const old = oldBlockOf(source);
+    const result = replaceManagedBlock(source, "sess-01ab", "daily", "- corto");
+    expect(result.kind).toBe("replaced");
+    if (result.kind === "replaced") {
+      const newBody = "- corto\n";
+      assertConsistent(result.source, result.block, newBody);
+      // offsets before the body are unchanged
+      expect(result.block.begin_start).toBe(old.begin_start);
+      expect(result.block.begin_end).toBe(old.begin_end);
+      expect(result.block.body_start).toBe(old.body_start);
+      // prefix and suffix stay byte-identical
+      expect(result.source.slice(0, result.block.body_start)).toBe(
+        source.slice(0, old.body_start),
+      );
+      expect(result.source.slice(result.block.body_start + newBody.length)).toBe(
+        source.slice(old.body_end),
+      );
+      expect(result.source).toBe(
+        source.slice(0, old.body_start) + newBody + source.slice(old.body_end),
+      );
+    }
+  });
+
+  it("returns a block consistent with the new source for a longer LF replacement", () => {
+    const source = blockSource("- hecho");
+    const old = oldBlockOf(source);
+    const result = replaceManagedBlock(
+      source,
+      "sess-01ab",
+      "daily",
+      "- hecho\n- mucho más contenido\n- y todavía más",
+    );
+    expect(result.kind).toBe("replaced");
+    if (result.kind === "replaced") {
+      const newBody = "- hecho\n- mucho más contenido\n- y todavía más\n";
+      assertConsistent(result.source, result.block, newBody);
+      expect(result.source).toBe(
+        source.slice(0, old.body_start) + newBody + source.slice(old.body_end),
+      );
+    }
+  });
+
+  it("returns a block consistent with the new source for CRLF replacements", () => {
+    const source = [
+      "# 2026-08-11",
+      "",
+      "## Tareas",
+      "",
+      "<!-- resyst-vault:begin session=sess-01ab target=daily -->",
+      "- hecho",
+      "<!-- resyst-vault:end session=sess-01ab target=daily -->",
+      "",
+      "## Reflexión",
+      "",
+    ].join("\r\n");
+    const old = oldBlockOf(source);
+    const result = replaceManagedBlock(source, "sess-01ab", "daily", "- nuevo");
+    expect(result.kind).toBe("replaced");
+    if (result.kind === "replaced") {
+      const newBody = "- nuevo\r\n";
+      assertConsistent(result.source, result.block, newBody);
+      expect(result.source).toBe(
+        source.slice(0, old.body_start) + newBody + source.slice(old.body_end),
+      );
+      expect(result.source.slice(result.block.end_end)).toBe(
+        source.slice(old.end_end),
+      );
+    }
+  });
+});
+
+describe("body line-ending normalization", () => {
+  function crlfSource(body: string): string {
+    return [
+      "# 2026-08-11",
+      "",
+      "## Tareas",
+      "",
+      "<!-- resyst-vault:begin session=sess-01ab target=daily -->",
+      ...body.split("\n"),
+      "<!-- resyst-vault:end session=sess-01ab target=daily -->",
+      "",
+      "## Reflexión",
+      "",
+    ].join("\r\n");
+  }
+
+  function oldBlockOf(source: string): ManagedBlock {
+    const note = parse(source);
+    expect(note.managed.kind).toBe("ok");
+    if (note.managed.kind === "ok") {
+      return note.managed.blocks[0]!;
+    }
+    throw new Error("fixture must contain one managed block");
+  }
+
+  it("normalizes CRLF and lone-CR body endings into an LF note on replace", () => {
+    const source = blockSource("- hecho");
+    const old = oldBlockOf(source);
+    const result = replaceManagedBlock(
+      source,
+      "sess-01ab",
+      "daily",
+      "- a\r\n- b\r- c\n- d",
+    );
+    expect(result.kind).toBe("replaced");
+    if (result.kind === "replaced") {
+      const body = result.source.slice(
+        result.block.body_start,
+        result.block.body_end,
+      );
+      expect(body).toBe("- a\n- b\n- c\n- d\n");
+      expect(body.includes("\r")).toBe(false);
+      // outside bytes stay exact
+      expect(result.source).toBe(
+        source.slice(0, old.body_start) + "- a\n- b\n- c\n- d\n" + source.slice(old.body_end),
+      );
+    }
+  });
+
+  it("normalizes mixed body endings into a CRLF note on replace", () => {
+    const source = crlfSource("- hecho");
+    const old = oldBlockOf(source);
+    const result = replaceManagedBlock(
+      source,
+      "sess-01ab",
+      "daily",
+      "- a\n- b\r\n- c\r- d",
+    );
+    expect(result.kind).toBe("replaced");
+    if (result.kind === "replaced") {
+      const body = result.source.slice(
+        result.block.body_start,
+        result.block.body_end,
+      );
+      expect(body).toBe("- a\r\n- b\r\n- c\r\n- d\r\n");
+      expect(result.source).toBe(
+        source.slice(0, old.body_start) + body + source.slice(old.body_end),
+      );
+    }
+  });
+
+  it("normalizes mixed body endings into an LF note on insert", () => {
+    const source = "# Nota\n\n## Tareas\n";
+    const result = insertManagedBlock(
+      source,
+      "## Tareas",
+      "sess-01ab",
+      "daily",
+      "- a\r\n- b\r- c\n- d",
+    );
+    expect(result.kind).toBe("inserted");
+    if (result.kind === "inserted") {
+      const body = result.source.slice(
+        result.block.body_start,
+        result.block.body_end,
+      );
+      expect(body).toBe("- a\n- b\n- c\n- d\n");
+    }
+  });
+
+  it("normalizes mixed body endings into a CRLF note on insert", () => {
+    const source = "# Nota\r\n\r\n## Tareas\r\n";
+    const result = insertManagedBlock(
+      source,
+      "## Tareas",
+      "sess-01ab",
+      "daily",
+      "- a\n- b\r\n- c\r- d",
+    );
+    expect(result.kind).toBe("inserted");
+    if (result.kind === "inserted") {
+      const body = result.source.slice(
+        result.block.body_start,
+        result.block.body_end,
+      );
+      expect(body).toBe("- a\r\n- b\r\n- c\r\n- d\r\n");
+    }
+  });
+
+  it("preserves CR-only documents and writes CR-only bodies", () => {
+    const source = [
+      "# 2026-08-11",
+      "",
+      "## Tareas",
+      "",
+      "<!-- resyst-vault:begin session=sess-01ab target=daily -->",
+      "- hecho",
+      "<!-- resyst-vault:end session=sess-01ab target=daily -->",
+      "",
+      "## Reflexión",
+      "",
+    ].join("\r");
+    const note = parse(source);
+    expect(note.line_ending).toBe("\r");
+    const old = oldBlockOf(source);
+    const result = replaceManagedBlock(
+      source,
+      "sess-01ab",
+      "daily",
+      "- a\n- b\r\n- c\r- d",
+    );
+    expect(result.kind).toBe("replaced");
+    if (result.kind === "replaced") {
+      const body = result.source.slice(
+        result.block.body_start,
+        result.block.body_end,
+      );
+      expect(body).toBe("- a\r- b\r- c\r- d\r");
+      expect(body.includes("\n")).toBe(false);
+      expect(result.source).toBe(
+        source.slice(0, old.body_start) + body + source.slice(old.body_end),
+      );
+    }
+  });
+
+  it("inserts into a CR-only note with CR separators", () => {
+    const source = "# Nota\r\r## Tareas\r";
+    const result = insertManagedBlock(
+      source,
+      "## Tareas",
+      "sess-01ab",
+      "daily",
+      "- a\n- b",
+    );
+    expect(result.kind).toBe("inserted");
+    if (result.kind === "inserted") {
+      const body = result.source.slice(
+        result.block.body_start,
+        result.block.body_end,
+      );
+      expect(body).toBe("- a\r- b\r");
+      expect(
+        result.source.slice(result.block.end_end),
+      ).toBe("\r");
+      expect(result.source).toContain(
+        "<!-- resyst-vault:begin session=sess-01ab target=daily -->\r- a\r- b\r",
+      );
+    }
+  });
+});
+
+describe("fence info strings", () => {
+  it("does not treat a backtick fence whose info string contains a backtick as a fence", () => {
+    const note = parse("```foo`bar\n\n## Tareas\n");
+    expect(note.headings.map((h) => h.text)).toEqual(["Tareas"]);
+  });
+
+  it("validates managed markers after a false fence opener", () => {
+    const source = [
+      "```foo`bar",
+      "",
+      "<!-- resyst-vault:begin session=sess-01ab target=daily -->",
+      "- hecho",
+      "<!-- resyst-vault:end session=sess-01ab target=daily -->",
+      "",
+    ].join("\n");
+    const note = parse(source);
+    expect(note.managed.kind).toBe("ok");
+    if (note.managed.kind === "ok") {
+      expect(note.managed.blocks).toHaveLength(1);
+    }
+    expect(replaceManagedBlock(source, "sess-01ab", "daily", "- nuevo").kind).toBe(
+      "replaced",
+    );
+  });
+
+  it("still suppresses content behind valid backtick and tilde fences", () => {
+    const source = [
+      "```",
+      "## Hidden backtick",
+      "```",
+      "",
+      "~~~foo`bar",
+      "## Hidden tilde",
+      "~~~",
+      "",
+      "## Visible",
+      "",
+    ].join("\n");
+    const note = parse(source);
+    expect(note.headings.map((h) => h.text)).toEqual(["Visible"]);
+  });
+
+  it("inserts exactly one block when a false fence opener precedes the heading", () => {
+    const source = "```foo`bar\n\n## Tareas\n";
+    const first = insertManagedBlock(
+      source,
+      "## Tareas",
+      "sess-01ab",
+      "daily",
+      "- uno",
+    );
+    expect(first.kind).toBe("inserted");
+    if (first.kind === "inserted") {
+      const note = parse(first.source);
+      expect(note.managed.kind).toBe("ok");
+      if (note.managed.kind === "ok") {
+        expect(note.managed.blocks).toHaveLength(1);
+      }
+      expect(
+        insertManagedBlock(
+          first.source,
+          "## Tareas",
+          "sess-01ab",
+          "daily",
+          "- dos",
+        ).kind,
+      ).toBe("block_exists");
+    }
+  });
+});
+
+
+describe("indented code exclusion", () => {
+  it("does not treat a 4-space-indented heading-like line as a heading", () => {
+    const note = parse("    ## Fake\n\n## Real\n");
+    expect(note.headings.map((h) => h.text)).toEqual(["Real"]);
+  });
+
+  it("does not make an indented paragraph+underline a setext heading", () => {
+    const note = parse("    Párrafo\n    ---\n\n# Real\n");
+    expect(note.headings.map((h) => h.text)).toEqual(["Real"]);
+  });
+
+  it("ignores markers inside indented code without failing closed", () => {
+    const source = [
+      "# Nota",
+      "",
+      "    <!-- resyst-vault:begin session=sess-01ab target=daily -->",
+      "    <!-- resyst-vault:end session=sess-01ab target=daily -->",
+      "",
+    ].join("\n");
+    const note = parse(source);
+    expect(note.managed.kind).toBe("ok");
+    if (note.managed.kind === "ok") {
+      expect(note.managed.blocks).toHaveLength(0);
+    }
+    expect(replaceManagedBlock(source, "sess-01ab", "daily", "x").kind).toBe(
+      "not_found",
+    );
+  });
+
+  it("ignores wikilinks inside indented code", () => {
+    const note = parse("    [[Fake]]\n\n[[Real]]\n");
+    expect(note.wikilinks.map((w) => w.target)).toEqual(["Real"]);
+  });
+
+  it("ignores tab-indented heading-like lines", () => {
+    const note = parse("\t## Fake\n\n## Real\n");
+    expect(note.headings.map((h) => h.text)).toEqual(["Real"]);
+  });
+});
+
+describe("wikilink boundaries", () => {
+  it("ignores wikilinks inside balanced inline code spans of variable run length", () => {
+    const note = parse(
+      "`[[Uno]]` y ``[[Dos]]`` y ```[[Tres]]``` y [[Cuatro]]\n",
+    );
+    expect(note.wikilinks.map((w) => w.target)).toEqual(["Cuatro"]);
+  });
+
+  it("does not close a link with a ] pair inside an inline code span", () => {
+    const note = parse("[[a `]]` b]]\n");
+    // the first ]] is inside code and does not close; the final ]] does
+    expect(note.wikilinks.map((w) => w.target)).toEqual(["a `]]` b"]);
+  });
+
+  it("rejects nested wikilinks as malformed", () => {
+    const note = parse("[[a [[b]] c]]\n");
+    // the outer link is rejected; the inner standalone link remains
+    expect(note.wikilinks.map((w) => w.target)).toEqual(["b"]);
+  });
+
+  it("rejects links whose inner text carries marker-like brackets", () => {
+    const note = parse("[[a <!-- resyst-vault:begin --> b]]\n\n[[Ok]]\n");
+    expect(note.wikilinks.map((w) => w.target)).toEqual(["Ok"]);
+  });
+});
+
+describe("wikilink scan bound", () => {
+  it("scans adversarial openers and fences in bounded time", () => {
+    const started = Date.now();
+    const manyOpeners = "[[".repeat(20_000) + "\n\n## Tareas\n";
+    const note = parse(manyOpeners);
+    expect(note.wikilinks).toHaveLength(0);
+    expect(note.headings.map((h) => h.text)).toEqual(["Tareas"]);
+
+    const manyFences = ("```\n".repeat(10_000)) + "## Visible\n";
+    const fenced = parse(manyFences);
+    expect(fenced.headings.map((h) => h.text)).toEqual(["Visible"]);
+    // generous practical bound; linear scan completes in milliseconds
+    expect(Date.now() - started).toBeLessThan(4000);
   });
 });

@@ -35,13 +35,35 @@ import { ID_PATTERN } from "./schemas.js";
 // Public result types
 // ---------------------------------------------------------------------------
 
+/** Maximum length of one narrowed frontmatter string value. */
+export const MAX_FRONTMATTER_STRING_LENGTH = 1024;
+
+/** Maximum number of items in one narrowed frontmatter list value. */
+export const MAX_FRONTMATTER_LIST_LENGTH = 64;
+
+/**
+ * Narrowed portable project metadata from the `resyst_project` frontmatter
+ * object: a required safe `id` plus exact output `repos`/`aliases` arrays
+ * (missing or empty input arrays normalize to `[]`). Unknown nested keys
+ * are never copied.
+ */
+export interface ResystProjectMetadata {
+  /** Safe opaque project id matching the shared ID pattern. */
+  id: string;
+  /** Bounded repository strings. */
+  repos: string[];
+  /** Bounded alias strings. */
+  aliases: string[];
+}
+
 /** Narrowed frontmatter metadata: only the five allowed fields survive. */
 export interface NoteMetadata {
   title: string | null;
   date: string | null;
   tags: string[];
   aliases: string[];
-  resyst_project: string | null;
+  /** Null when absent or when the portable object is malformed. */
+  resyst_project: ResystProjectMetadata | null;
 }
 
 /**
@@ -51,7 +73,14 @@ export interface NoteMetadata {
  */
 export type FrontmatterResult =
   | { kind: "missing" }
-  | { kind: "invalid" }
+  | {
+      /** Delimited frontmatter whose YAML body failed to parse. */
+      kind: "invalid";
+      start: number;
+      end: number;
+      body_start: number;
+      body_end: number;
+    }
   | {
       kind: "present";
       metadata: NoteMetadata;
@@ -128,7 +157,7 @@ export interface ParsedNote {
   /** The exact original source; never normalized or rewritten. */
   source: string;
   /** Document line-ending style, preserved through every write. */
-  line_ending: "\n" | "\r\n";
+  line_ending: "\n" | "\r\n" | "\r";
   frontmatter: FrontmatterResult;
   headings: HeadingOccurrence[];
   wikilinks: Wikilink[];
@@ -172,6 +201,7 @@ export type ManagedReplaceResult =
   | { kind: "ambiguous" }
   | { kind: "malformed"; reason: ManagedBlocksError }
   | { kind: "invalid_id" }
+  | { kind: "invalid_frontmatter" }
   | { kind: "marker_text_rejected"; message: typeof MARKER_TEXT_REJECTED_MESSAGE };
 
 /** Outcome of inserting one managed block under a configured heading. */
@@ -183,6 +213,7 @@ export type ManagedInsertResult =
   | { kind: "malformed"; reason: ManagedBlocksError }
   | { kind: "invalid_id" }
   | { kind: "invalid_heading" }
+  | { kind: "invalid_frontmatter" }
   | { kind: "marker_text_rejected"; message: typeof MARKER_TEXT_REJECTED_MESSAGE };
 
 // ---------------------------------------------------------------------------
@@ -229,14 +260,14 @@ function lineInfos(source: string): LineInfo[] {
 }
 
 /** Detect the document line-ending style from the first line ending. */
-function detectLineEnding(source: string): "\n" | "\r\n" {
+function detectLineEnding(source: string): "\n" | "\r\n" | "\r" {
   for (let i = 0; i < source.length; i += 1) {
     const ch = source[i];
     if (ch === "\n") {
       return source[i - 1] === "\r" ? "\r\n" : "\n";
     }
     if (ch === "\r") {
-      return source[i + 1] === "\n" ? "\r\n" : "\n";
+      return source[i + 1] === "\n" ? "\r\n" : "\r";
     }
   }
   return "\n";
@@ -246,12 +277,18 @@ function detectLineEnding(source: string): "\n" | "\r\n" {
 // Frontmatter
 // ---------------------------------------------------------------------------
 
-/** Parse and narrow the leading YAML frontmatter block of a note. */
-export function parseFrontmatter(source: string): FrontmatterResult {
-  const lines = lineInfos(source);
+/**
+ * Locate a leading `---`-delimited frontmatter block, independent of YAML
+ * validity. A leading `---` with no closing delimiter is a thematic break,
+ * not a frontmatter block (intentional policy: such documents are scanned
+ * normally).
+ */
+function findFrontmatterRegion(
+  lines: LineInfo[],
+): { start: number; end: number; body_start: number; body_end: number } | null {
   const first = lines[0];
   if (!first || first.text !== "---") {
-    return { kind: "missing" };
+    return null;
   }
   let closeIndex = -1;
   for (let i = 1; i < lines.length; i += 1) {
@@ -261,30 +298,49 @@ export function parseFrontmatter(source: string): FrontmatterResult {
       break;
     }
   }
-  // An opening `---` with no closing delimiter is a thematic break.
   if (closeIndex === -1) {
-    return { kind: "missing" };
+    return null;
   }
   const closeLine = lines[closeIndex];
   if (!closeLine) {
+    return null;
+  }
+  return {
+    start: 0,
+    end: closeLine.end,
+    body_start: first.end,
+    body_end: closeLine.start,
+  };
+}
+
+/** Parse and narrow the leading YAML frontmatter block of a note. */
+export function parseFrontmatter(source: string): FrontmatterResult {
+  const lines = lineInfos(source);
+  const region = findFrontmatterRegion(lines);
+  if (!region) {
     return { kind: "missing" };
   }
-  const bodyStart = first.end;
-  const bodyEnd = closeLine.start;
-  const end = closeLine.end;
   let raw: unknown;
   try {
-    raw = parseYaml(source.slice(bodyStart, bodyEnd), { maxAliasCount: 100 });
+    raw = parseYaml(source.slice(region.body_start, region.body_end), {
+      maxAliasCount: 100,
+    });
   } catch {
-    return { kind: "invalid" };
+    return {
+      kind: "invalid",
+      start: region.start,
+      end: region.end,
+      body_start: region.body_start,
+      body_end: region.body_end,
+    };
   }
   return {
     kind: "present",
     metadata: narrowMetadata(raw),
-    start: 0,
-    end,
-    body_start: bodyStart,
-    body_end: bodyEnd,
+    start: region.start,
+    end: region.end,
+    body_start: region.body_start,
+    body_end: region.body_end,
   };
 }
 
@@ -311,25 +367,83 @@ function narrowMetadata(raw: unknown): NoteMetadata {
   }
   metadata.tags = narrowStringList(record["tags"]);
   metadata.aliases = narrowStringList(record["aliases"]);
-  const project = record["resyst_project"];
-  if (typeof project === "string") {
-    metadata.resyst_project = project;
-  }
+  metadata.resyst_project = narrowProject(record["resyst_project"]);
   return metadata;
 }
 
-/** Narrow a tags/aliases value: a single string or an array of strings. */
+/**
+ * Narrow the portable `resyst_project` object. The value is null (absent)
+ * for legacy notes; when present it must be an object with a required safe
+ * `id`, and `repos`/`aliases` are optional input arrays that normalize to
+ * required output arrays (missing -> `[]`). Any present array that is not
+ * an array of bounded nonempty strings rejects the entire value to null;
+ * partial malformed metadata is never retained and unknown keys are never
+ * copied.
+ */
+function narrowProject(value: unknown): ResystProjectMetadata | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const id = record["id"];
+  if (typeof id !== "string" || !ID_RE.test(id)) {
+    return null;
+  }
+  const repos = narrowRequiredStringArray(record["repos"]);
+  if (repos === null) {
+    return null;
+  }
+  const aliases = narrowRequiredStringArray(record["aliases"]);
+  if (aliases === null) {
+    return null;
+  }
+  return { id, repos, aliases };
+}
+
+/** Narrow a required string array, or null when the contract is violated. */
+function narrowRequiredStringArray(value: unknown): string[] | null {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value) || value.length > MAX_FRONTMATTER_LIST_LENGTH) {
+    return null;
+  }
+  const out: string[] = [];
+  for (const item of value) {
+    if (
+      typeof item !== "string" ||
+      item.length === 0 ||
+      item.length > MAX_FRONTMATTER_STRING_LENGTH
+    ) {
+      return null;
+    }
+    out.push(item);
+  }
+  return out;
+}
+
+/**
+ * Narrow a note-level tags/aliases value: a single bounded string or a
+ * bounded array of bounded strings (non-conforming items are dropped).
+ */
 function narrowStringList(value: unknown): string[] {
   if (typeof value === "string") {
-    return [value];
+    return value.length <= MAX_FRONTMATTER_STRING_LENGTH ? [value] : [];
   }
   if (!Array.isArray(value)) {
     return [];
   }
   const out: string[] = [];
   for (const item of value) {
-    if (typeof item === "string") {
+    if (
+      typeof item === "string" &&
+      item.length > 0 &&
+      item.length <= MAX_FRONTMATTER_STRING_LENGTH
+    ) {
       out.push(item);
+      if (out.length >= MAX_FRONTMATTER_LIST_LENGTH) {
+        break;
+      }
     }
   }
   return out;
@@ -363,8 +477,30 @@ interface FenceRegion {
 /** Result of the single line-oriented scan pass. */
 interface DocumentScan {
   headings: HeadingOccurrence[];
+  /** Fenced code regions (backtick and tilde variants). */
   fences: FenceRegion[];
+  /** 4+-column indented code lines, excluded from all scanners. */
+  indented: FenceRegion[];
   managed: ManagedBlocksResult;
+}
+
+/** True for lines indented 4+ columns (spaces or tabs = 4 columns). */
+function isIndentedCode(text: string): boolean {
+  let columns = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === " ") {
+      columns += 1;
+    } else if (ch === "\t") {
+      columns += 4;
+    } else {
+      break;
+    }
+    if (columns >= 4) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -380,6 +516,7 @@ function scanDocument(
 ): DocumentScan {
   const headings: HeadingOccurrence[] = [];
   const fences: FenceRegion[] = [];
+  const indented: FenceRegion[] = [];
   const completed: ManagedBlock[] = [];
   const open: ManagedBlock[] = [];
   let error: ManagedBlocksError | null = null;
@@ -414,18 +551,32 @@ function scanDocument(
     const fenceOpen = FENCE_OPEN.exec(text);
     if (fenceOpen) {
       const marker = fenceOpen[1] ?? "";
-      inFence = {
-        char: marker[0] ?? "`",
-        length: marker.length,
-        start: line.start,
-      };
-      prevKind = "fence";
-      prevParagraph = null;
-      continue;
+      const info = fenceOpen[2] ?? "";
+      // CommonMark: a backtick fence whose info string contains a backtick
+      // is not a fence (the line is a paragraph); tilde info strings may
+      // contain backticks.
+      if (marker.startsWith("~") || !info.includes("`")) {
+        inFence = {
+          char: marker[0] ?? "`",
+          length: marker.length,
+          start: line.start,
+        };
+        prevKind = "fence";
+        prevParagraph = null;
+        continue;
+      }
+      // fall through: the line is a paragraph, not a fence opener
     }
 
     if (text.trim() === "") {
       prevKind = "blank";
+      prevParagraph = null;
+      continue;
+    }
+
+    if (isIndentedCode(text)) {
+      indented.push({ start: line.start, end: line.end });
+      prevKind = "other";
       prevParagraph = null;
       continue;
     }
@@ -546,20 +697,30 @@ function scanDocument(
       : { kind: "ok", blocks: completed };
   }
 
-  return { headings, fences, managed };
+  return { headings, fences, indented, managed };
 }
 
 // ---------------------------------------------------------------------------
 // Wikilinks
 // ---------------------------------------------------------------------------
 
-/** Parse the inner text of a closed `[[...]]` into a link, or null. */
+/**
+ * Parse the inner text of a closed `[[...]]` into a link, or null.
+ * Nested `[[`, marker-like brackets (`<!--`/`-->`), and empty targets are
+ * malformed and produce no link. Line breaks cannot occur (candidates are
+ * bounded to one line by the scanner).
+ */
 function parseWikilink(
   inner: string,
   start: number,
   end: number,
 ): Wikilink | null {
-  if (inner === "") {
+  if (
+    inner === "" ||
+    inner.includes("[[") ||
+    inner.includes("<!--") ||
+    inner.includes("-->")
+  ) {
     return null;
   }
   let targetPart = inner;
@@ -589,54 +750,136 @@ function parseWikilink(
 }
 
 /**
- * Scan for well-formed `[[...]]` wikilinks, ignoring fenced code regions
- * and the frontmatter block. Unclosed or empty links are skipped.
+ * Compute inline-code spans of one line. A backtick run opens a span; the
+ * next run of the same length closes it (runs of other lengths are literal
+ * content inside the span). An unmatched opening run is literal text, so no
+ * region is produced. Single linear pass per line.
  */
-function scanWikilinks(
-  source: string,
-  regions: Array<{ start: number; end: number }>,
-): Wikilink[] {
-  const links: Wikilink[] = [];
-  const n = source.length;
+function inlineCodeRegions(text: string, base: number): Array<{ start: number; end: number }> {
+  const regions: Array<{ start: number; end: number }> = [];
+  const len = text.length;
+  let openRun = -1;
+  let openPos = -1;
   let i = 0;
-  while (i < n - 1) {
-    const region = regions.find((r) => r.start <= i && i < r.end);
-    if (region) {
-      i = region.end;
+  while (i < len) {
+    if (text[i] !== "`") {
+      i += 1;
       continue;
     }
-    if (source[i] === "[" && source[i + 1] === "[") {
-      let depth = 1;
+    let run = 0;
+    while (i + run < len && text[i + run] === "`") {
+      run += 1;
+    }
+    if (openRun === -1) {
+      openRun = run;
+      openPos = i;
+    } else if (run === openRun) {
+      regions.push({ start: base + openPos, end: base + i + run });
+      openRun = -1;
+      openPos = -1;
+    }
+    i += run;
+  }
+  return regions;
+}
+
+/**
+ * Scan one non-excluded line for well-formed `[[...]]` wikilinks, skipping
+ * inline-code spans. The closer search never crosses the line, never enters
+ * an inline-code span, and stops at a nested `[[` (rejecting the outer
+ * link). A per-line `noCloserAfter` cache keeps the pass linear even when a
+ * line holds thousands of unclosed openers.
+ */
+function scanLineLinks(
+  text: string,
+  base: number,
+  codeRegions: Array<{ start: number; end: number }>,
+): Wikilink[] {
+  const links: Wikilink[] = [];
+  const len = text.length;
+  let regionIdx = 0;
+  let noCloserAfter = -1;
+  let i = 0;
+  while (i < len - 1) {
+    while (regionIdx < codeRegions.length && codeRegions[regionIdx]!.end <= i) {
+      regionIdx += 1;
+    }
+    const codeRegion = codeRegions[regionIdx];
+    if (codeRegion && i >= codeRegion.start) {
+      i = codeRegion.end;
+      continue;
+    }
+    if (text[i] === "[" && text[i + 1] === "[") {
+      if (noCloserAfter >= 0 && i >= noCloserAfter) {
+        i += 2;
+        continue;
+      }
       let j = i + 2;
+      let codeIdx = regionIdx;
       let closed = false;
-      while (j < n - 1) {
-        if (source[j] === "[" && source[j + 1] === "[") {
-          depth += 1;
-          j += 2;
-        } else if (source[j] === "]" && source[j + 1] === "]") {
-          depth -= 1;
-          j += 2;
-          if (depth === 0) {
-            closed = true;
-            break;
-          }
-        } else {
-          j += 1;
+      while (j < len - 1) {
+        while (codeIdx < codeRegions.length && codeRegions[codeIdx]!.end <= j) {
+          codeIdx += 1;
         }
+        const span = codeRegions[codeIdx];
+        if (span && j >= span.start) {
+          j = span.end;
+          continue;
+        }
+        if (text[j] === "[" && text[j + 1] === "[") {
+          break;
+        }
+        if (text[j] === "]" && text[j + 1] === "]") {
+          closed = true;
+          break;
+        }
+        j += 1;
       }
       if (closed) {
-        const inner = source.slice(i + 2, j - 2);
-        const link = parseWikilink(inner, i, j);
+        const link = parseWikilink(text.slice(i + 2, j), base + i, base + j + 2);
         if (link) {
           links.push(link);
         }
-        i = j;
-      } else {
-        i += 2;
+        i = j + 2;
+        continue;
       }
+      if (j >= len - 1) {
+        noCloserAfter = i;
+      }
+      i += 2;
       continue;
     }
     i += 1;
+  }
+  return links;
+}
+
+/**
+ * Scan for well-formed `[[...]]` wikilinks with bounded monotonic logic:
+ * excluded whole-line regions (frontmatter, fences, indented code) are
+ * skipped with a cursor, inline-code spans per line are excluded, and each
+ * candidate is bounded to its own line. Unclosed, nested, and
+ * marker-bracket-carrying candidates are malformed and never emitted.
+ */
+function scanWikilinks(
+  lines: LineInfo[],
+  excluded: Array<{ start: number; end: number }>,
+): Wikilink[] {
+  const links: Wikilink[] = [];
+  let regionIdx = 0;
+  for (const line of lines) {
+    while (regionIdx < excluded.length && excluded[regionIdx]!.end <= line.start) {
+      regionIdx += 1;
+    }
+    const excludedRegion = excluded[regionIdx];
+    if (
+      excludedRegion &&
+      excludedRegion.start <= line.start &&
+      line.end <= excludedRegion.end
+    ) {
+      continue;
+    }
+    links.push(...scanLineLinks(line.text, line.start, inlineCodeRegions(line.text, line.start)));
   }
   return links;
 }
@@ -650,16 +893,17 @@ export function parseNote(source: string): ParsedNote {
   const lineEnding = detectLineEnding(source);
   const lines = lineInfos(source);
   const frontmatter = parseFrontmatter(source);
-  const frontmatterRegion =
-    frontmatter.kind === "present"
-      ? { start: frontmatter.start, end: frontmatter.end }
-      : null;
+  // Delimiter-region detection is independent of YAML validity: a found
+  // leading `---` block is excluded from headings, wikilinks, fences, and
+  // managed markers even when its YAML body fails to parse.
+  const frontmatterRegion = findFrontmatterRegion(lines);
   const scan = scanDocument(source, lines, frontmatterRegion);
-  const regions: Array<{ start: number; end: number }> = [
+  const excluded: Array<{ start: number; end: number }> = [
     ...scan.fences,
+    ...scan.indented,
     ...(frontmatterRegion ? [frontmatterRegion] : []),
   ];
-  const wikilinks = scanWikilinks(source, regions);
+  const wikilinks = scanWikilinks(lines, excluded);
   return {
     source,
     line_ending: lineEnding,
@@ -770,16 +1014,14 @@ function containsMarkerLikeText(text: string): boolean {
   return MARKER_LIKE.test(text);
 }
 
-/** Normalize a body to the document line ending and one trailing break. */
-function normalizeBody(body: string, eol: "\n" | "\r\n"): string {
-  let normalized = body;
-  if (eol === "\r\n") {
-    normalized = normalized.replace(/(?<!\r)\n/g, "\r\n");
-  }
-  if (!normalized.endsWith(eol)) {
-    normalized += eol;
-  }
-  return normalized;
+/**
+ * Normalize every input line ending (CRLF, lone CR, lone LF) to the
+ * document's chosen style and ensure exactly one trailing break, so a
+ * replacement/insertion body can never introduce mixed line endings.
+ */
+function normalizeBody(body: string, eol: "\n" | "\r\n" | "\r"): string {
+  const normalized = body.replace(/\r\n|\r|\n/g, eol);
+  return normalized.endsWith(eol) ? normalized : `${normalized}${eol}`;
 }
 
 /**
@@ -804,6 +1046,9 @@ export function replaceManagedBlock(
     };
   }
   const note = parseNote(source);
+  if (note.frontmatter.kind === "invalid") {
+    return { kind: "invalid_frontmatter" };
+  }
   if (note.managed.kind === "malformed") {
     return { kind: "malformed", reason: note.managed.reason };
   }
@@ -820,11 +1065,26 @@ export function replaceManagedBlock(
   if (!block) {
     return { kind: "not_found" };
   }
+  const normalized = normalizeBody(body, note.line_ending);
   const next =
     source.slice(0, block.body_start) +
-    normalizeBody(body, note.line_ending) +
+    normalized +
     source.slice(block.body_end);
-  return { kind: "replaced", source: next, block };
+  // Return the block recomputed against the NEW source: the body offsets
+  // shift when the replacement body length differs from the original.
+  const endMarkerLength = block.end_end - block.end_start;
+  const newBodyEnd = block.body_start + normalized.length;
+  const updated: ManagedBlock = {
+    session_id: sessionId,
+    target,
+    begin_start: block.begin_start,
+    begin_end: block.begin_end,
+    body_start: block.body_start,
+    body_end: newBodyEnd,
+    end_start: newBodyEnd,
+    end_end: newBodyEnd + endMarkerLength,
+  };
+  return { kind: "replaced", source: next, block: updated };
 }
 
 /**
@@ -854,6 +1114,9 @@ export function insertManagedBlock(
     return { kind: "invalid_heading" };
   }
   const note = parseNote(source);
+  if (note.frontmatter.kind === "invalid") {
+    return { kind: "invalid_frontmatter" };
+  }
   if (note.managed.kind === "malformed") {
     return { kind: "malformed", reason: note.managed.reason };
   }
