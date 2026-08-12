@@ -40,10 +40,15 @@ export const SCHEMA_REJECTED_MESSAGE =
 export const EVIDENCE_CITATION_ERROR_MESSAGE =
   "evidence citations must reference known evidence ids";
 
+/** Fixed body of the duplicate-evidence message. */
+export const DUPLICATE_EVIDENCE_ERROR_MESSAGE =
+  "evidence ids must be unique across all evidence collections";
+
 /** Error codes produced by the validation boundary. */
 export type SchemaErrorCode =
   | "SCHEMA_VALIDATION_ERROR"
-  | "EVIDENCE_CITATION_ERROR";
+  | "EVIDENCE_CITATION_ERROR"
+  | "DUPLICATE_EVIDENCE_ERROR";
 
 /** Fixed error for a payload rejected by a versioned schema. */
 export class SchemaValidationError extends Error {
@@ -338,13 +343,31 @@ export const CheckpointSchema = Type.Union([
   NoopCheckpointSchema,
 ]);
 
-/** One written file inside an applied transaction. */
-export const ReceiptTargetSchema = Type.Object(
+/**
+ * Planned/apply transition: the exact resolved hash state for one
+ * vault-relative path. A null `before_hash` means the file is created
+ * (null -> hash); a null `after_hash` never appears on an apply transition.
+ */
+export const ApplyTargetSchema = Type.Object(
   {
     path: VaultPathSchema,
     /** Null when the file did not exist before the transaction (creation). */
     before_hash: Type.Union([HashHexSchema, Type.Null()]),
     after_hash: HashHexSchema,
+  },
+  { additionalProperties: false },
+);
+
+/**
+ * Rollback transition: restores `before_hash` content, or deletes a file
+ * created by the original apply when `after_hash` is null (hash -> null).
+ */
+export const RollbackTargetSchema = Type.Object(
+  {
+    path: VaultPathSchema,
+    before_hash: HashHexSchema,
+    /** Null when the rollback deletes the file created by the original apply. */
+    after_hash: Type.Union([HashHexSchema, Type.Null()]),
   },
   { additionalProperties: false },
 );
@@ -355,7 +378,7 @@ export const AppliedReceiptSchema = Type.Object(
     outcome: Type.Literal("applied"),
     event_id: EventIdSchema,
     idempotency_key: IdempotencyKeySchema,
-    targets: Type.Array(ReceiptTargetSchema, { minItems: 1 }),
+    targets: Type.Array(ApplyTargetSchema, { minItems: 1 }),
     created_at: IsoTimestampSchema,
   },
   { additionalProperties: false },
@@ -380,6 +403,8 @@ export const DeferredConflictReceiptSchema = Type.Object(
     idempotency_key: IdempotencyKeySchema,
     proposal_path: VaultPathSchema,
     conflict_paths: Type.Array(VaultPathSchema),
+    /** Planned apply transitions; empty only when no target reached planning. */
+    targets: Type.Array(ApplyTargetSchema),
     created_at: IsoTimestampSchema,
   },
   { additionalProperties: false },
@@ -392,6 +417,8 @@ export const FailedReceiptSchema = Type.Object(
     event_id: EventIdSchema,
     idempotency_key: IdempotencyKeySchema,
     reason: FailReasonSchema,
+    /** Planned apply transitions; empty only when no target reached planning. */
+    targets: Type.Array(ApplyTargetSchema),
     created_at: IsoTimestampSchema,
   },
   { additionalProperties: false },
@@ -404,6 +431,8 @@ export const RolledBackReceiptSchema = Type.Object(
     event_id: EventIdSchema,
     idempotency_key: IdempotencyKeySchema,
     target_event_id: EventIdSchema,
+    /** Non-empty rollback transitions applied to restore or delete files. */
+    rollback_targets: Type.Array(RollbackTargetSchema, { minItems: 1 }),
     created_at: IsoTimestampSchema,
   },
   { additionalProperties: false },
@@ -431,6 +460,8 @@ export const JournalEventSchema = Type.Union([
       idempotency_key: IdempotencyKeySchema,
       created_at: IsoTimestampSchema,
       checkpoint: ApplyCheckpointSchema,
+      /** Non-empty planned apply transitions with resolved hash state. */
+      planned_targets: Type.Array(ApplyTargetSchema, { minItems: 1 }),
     },
     { additionalProperties: false },
   ),
@@ -454,6 +485,11 @@ export const JournalEventSchema = Type.Union([
       created_at: IsoTimestampSchema,
       checkpoint: ApplyCheckpointSchema,
       reason: DeferReasonSchema,
+      /**
+       * Planned apply transitions; empty only when resolution never yielded
+       * a writable path.
+       */
+      planned_targets: Type.Array(ApplyTargetSchema),
     },
     { additionalProperties: false },
   ),
@@ -476,6 +512,8 @@ export const JournalEventSchema = Type.Union([
       idempotency_key: IdempotencyKeySchema,
       created_at: IsoTimestampSchema,
       target_event_id: EventIdSchema,
+      /** Non-empty rollback transitions restoring or deleting files. */
+      rollback_targets: Type.Array(RollbackTargetSchema, { minItems: 1 }),
     },
     { additionalProperties: false },
   ),
@@ -567,7 +605,8 @@ export type ProjectRef = StaticDecode<typeof ProjectRefSchema>;
 export type ApplyCheckpoint = StaticDecode<typeof ApplyCheckpointSchema>;
 export type NoopCheckpoint = StaticDecode<typeof NoopCheckpointSchema>;
 export type CheckpointRequest = StaticDecode<typeof CheckpointSchema>;
-export type ReceiptTarget = StaticDecode<typeof ReceiptTargetSchema>;
+export type ApplyTarget = StaticDecode<typeof ApplyTargetSchema>;
+export type RollbackTarget = StaticDecode<typeof RollbackTargetSchema>;
 export type AppliedReceipt = StaticDecode<typeof AppliedReceiptSchema>;
 export type NoopReceipt = StaticDecode<typeof NoopReceiptSchema>;
 export type DeferredConflictReceipt = StaticDecode<
@@ -581,6 +620,33 @@ export type ProjectResolution = StaticDecode<typeof ProjectResolutionSchema>;
 export type BootstrapFragment = StaticDecode<typeof BootstrapFragmentSchema>;
 export type BootstrapResult = StaticDecode<typeof BootstrapResultSchema>;
 export type SearchHit = StaticDecode<typeof SearchHitSchema>;
+
+/**
+ * Assert evidence ids are globally unique across all five evidence
+ * collections (no duplicates within a collection or across categories).
+ */
+function assertUniqueEvidenceIds(checkpoint: ApplyCheckpoint): void {
+  const seen = new Set<EvidenceId>();
+  const collections = [
+    checkpoint.evidence.commits,
+    checkpoint.evidence.tests,
+    checkpoint.evidence.files,
+    checkpoint.evidence.deployments,
+    checkpoint.evidence.observations,
+  ];
+  for (const collection of collections) {
+    for (const item of collection) {
+      if (seen.has(item.id)) {
+        throw new SchemaValidationError(
+          "checkpoint",
+          `invalid checkpoint: ${DUPLICATE_EVIDENCE_ERROR_MESSAGE}`,
+          "DUPLICATE_EVIDENCE_ERROR",
+        );
+      }
+      seen.add(item.id);
+    }
+  }
+}
 
 /** Assert every cited evidence id exists in one of the evidence collections. */
 function assertKnownEvidenceCitations(checkpoint: ApplyCheckpoint): void {
@@ -620,11 +686,17 @@ function assertKnownEvidenceCitations(checkpoint: ApplyCheckpoint): void {
   }
 }
 
+/** All semantic checks shared by every checkpoint-carrying parse path. */
+function assertCheckpointSemantics(checkpoint: ApplyCheckpoint): void {
+  assertKnownEvidenceCitations(checkpoint);
+  assertUniqueEvidenceIds(checkpoint);
+}
+
 /** Parse a checkpoint request or throw a redacted validation error. */
 export function parseCheckpoint(value: unknown): CheckpointRequest {
   const checkpoint = parseWithSchema(CheckpointSchema, value, "checkpoint");
   if (checkpoint.kind === "apply") {
-    assertKnownEvidenceCitations(checkpoint);
+    assertCheckpointSemantics(checkpoint);
   }
   return checkpoint;
 }
@@ -644,7 +716,7 @@ export function parseReceipt(value: unknown): Receipt {
 export function parseJournalEvent(value: unknown): JournalEvent {
   const event = parseWithSchema(JournalEventSchema, value, "journal event");
   if (event.kind === "apply" || event.kind === "deferred") {
-    assertKnownEvidenceCitations(event.checkpoint);
+    assertCheckpointSemantics(event.checkpoint);
   }
   return event;
 }

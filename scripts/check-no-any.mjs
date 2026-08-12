@@ -12,15 +12,21 @@
  *
  *   <path>|<line>|<column>|<sha256>|<test-path>|<rationale>
  *
- * - path:      repo-relative path of the file carrying the exception.
+ * - path:      canonical repo-relative POSIX path (`.ts`/`.tsx`) of the
+ *              file carrying the exception; must resolve inside the repo.
  * - line:      1-based line of the `any` occurrence (Biome start line).
  * - column:    1-based column of the occurrence start (Biome start column).
  * - sha256:    lowercase hex SHA-256 of the exact source line (bytes up to
  *              but excluding the line terminator) at <path>:<line>.
- * - test-path: repo-relative path of a regression test that exercises the
- *              exception; must exist under tests/.
+ * - test-path: canonical repo-relative POSIX path (`.ts`/`.tsx`) of a
+ *              regression test that exercises the exception; must resolve
+ *              inside <root>/tests and exist.
  * - rationale: nonempty free-text justification (the remainder of the line,
  *              so it may contain further `|` characters).
+ *
+ * Paths reject absolute forms, backslashes, control characters, dot/empty/
+ * dotdot segments, doubled or trailing slashes, and any form that resolves
+ * outside the expected base directory.
  *
  * An entry suppresses a violation only when path, line, column, and sha256
  * all match the current diagnostic exactly. No broad line-only suppression
@@ -79,6 +85,35 @@ function sha256Line(file, line) {
 }
 
 /**
+ * Validate a canonical repo-relative POSIX path.
+ *
+ * Rejects absolute paths, backslashes, control characters, dot/empty/dotdot
+ * segments, doubled or trailing slashes, missing required extensions, and
+ * paths that resolve outside `base` (containment). Returns an error string
+ * or null when the path is canonical.
+ */
+function canonicalPosixPath(value, extensions, base) {
+  if (!value) return "path must be nonempty";
+  if (value.startsWith("/")) return "path must be repo-relative, not absolute";
+  if (value.includes("\\")) return "path must use forward slashes";
+  if (/[\u0000-\u001F\u007F]/.test(value)) return "path must not contain control characters";
+  const segments = value.split("/");
+  for (const segment of segments) {
+    if (segment.length === 0) return "path must not contain empty or doubled slash segments";
+    if (segment === "." || segment === "..") return "path must not contain dot or dotdot segments";
+  }
+  if (!extensions.some((extension) => value.endsWith(extension))) {
+    return `path must end with ${extensions.join(" or ")}`;
+  }
+  const resolved = path.resolve(base, value);
+  const baseResolved = path.resolve(base);
+  if (resolved !== baseResolved && !resolved.startsWith(baseResolved + path.sep)) {
+    return "path must resolve inside its base directory";
+  }
+  return null;
+}
+
+/**
  * Parse and validate allowlist entries.
  * Returns { entries, errors } where entries is a Map keyed by
  * path|line|column and errors is a list of human-readable problems.
@@ -102,8 +137,9 @@ function parseAllowlist(allowlistPath) {
       continue;
     }
     const [entryPath, lineText, columnText, sha, testPath, rationale] = parts;
-    if (!entryPath || entryPath.startsWith("/") || entryPath.includes("\\")) {
-      errors.push(`allowlist ${number}: path must be repo-relative: ${raw}`);
+    const pathError = canonicalPosixPath(entryPath ?? "", [".ts", ".tsx"], ROOT);
+    if (pathError) {
+      errors.push(`allowlist ${number}: ${pathError}: ${raw}`);
       continue;
     }
     const line = Number(lineText);
@@ -116,8 +152,13 @@ function parseAllowlist(allowlistPath) {
       errors.push(`allowlist ${number}: sha256 must be 64 lowercase hex chars: ${raw}`);
       continue;
     }
-    if (!testPath || testPath.startsWith("/") || !testPath.startsWith("tests/")) {
-      errors.push(`allowlist ${number}: test-path must be a repo-relative path under tests/: ${raw}`);
+    const testError = canonicalPosixPath(
+      testPath ?? "",
+      [".ts", ".tsx"],
+      path.join(ROOT, "tests"),
+    );
+    if (testError) {
+      errors.push(`allowlist ${number}: ${testError}: ${raw}`);
       continue;
     }
     if (!existsSync(path.join(ROOT, testPath))) {

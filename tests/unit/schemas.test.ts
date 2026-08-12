@@ -1,5 +1,6 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 import {
+  DUPLICATE_EVIDENCE_ERROR_MESSAGE,
   EVIDENCE_CITATION_ERROR_MESSAGE,
   parseBootstrapResult,
   parseCheckpoint,
@@ -110,6 +111,7 @@ function validDeferredReceipt(): Record<string, unknown> {
     idempotency_key: fixtureHash(3),
     proposal_path: "Inbox/proposal-evt-0003.md",
     conflict_paths: ["Notas Diarias/2026-08-11.md"],
+    targets: [],
     created_at: "2026-08-11T09:32:00.000Z",
   };
 }
@@ -121,6 +123,7 @@ function validFailedReceipt(reason = "precondition_mismatch"): Record<string, un
     event_id: "evt-0004",
     idempotency_key: fixtureHash(4),
     reason,
+    targets: [],
     created_at: "2026-08-11T09:33:00.000Z",
   };
 }
@@ -132,6 +135,13 @@ function validRolledBackReceipt(): Record<string, unknown> {
     event_id: "evt-0005",
     idempotency_key: fixtureHash(5),
     target_event_id: "evt-0001",
+    rollback_targets: [
+      {
+        path: "Notas Diarias/2026-08-11.md",
+        before_hash: sha256("a"),
+        after_hash: null,
+      },
+    ],
     created_at: "2026-08-11T09:34:00.000Z",
   };
 }
@@ -146,15 +156,46 @@ function validJournal(kind: string): Record<string, unknown> {
   };
   switch (kind) {
     case "apply":
-      return { ...base, checkpoint: validApply() };
+      return {
+        ...base,
+        checkpoint: validApply(),
+        planned_targets: [
+          {
+            path: "Notas Diarias/2026-08-11.md",
+            before_hash: null,
+            after_hash: sha256("a"),
+          },
+        ],
+      };
     case "noop":
       return { ...base, checkpoint: validNoop("trivial") };
     case "deferred":
-      return { ...base, checkpoint: validApply(), reason: "conflict" };
+      return {
+        ...base,
+        checkpoint: validApply(),
+        reason: "conflict",
+        planned_targets: [
+          {
+            path: "Proyectos/Atlas.md",
+            before_hash: sha256("b"),
+            after_hash: sha256("c"),
+          },
+        ],
+      };
     case "recover":
       return { ...base, recovered_event_ids: ["evt-0001", "evt-0003"] };
     case "rollback":
-      return { ...base, target_event_id: "evt-0001" };
+      return {
+        ...base,
+        target_event_id: "evt-0001",
+        rollback_targets: [
+          {
+            path: "Notas Diarias/2026-08-11.md",
+            before_hash: sha256("a"),
+            after_hash: null,
+          },
+        ],
+      };
     default:
       return base;
   }
@@ -542,6 +583,51 @@ describe("parseCheckpoint", () => {
     expect(message).not.toContain("Parsed the atlas manifest");
   });
 
+  it("rejects duplicate evidence ids within one collection", () => {
+    const payload = validApply();
+    const evidence = payload.evidence as Record<string, unknown>;
+    evidence.commits = [
+      { id: "c1", value: "a1b2c3d4" },
+      { id: "c1", value: "a1b2c3d5" },
+    ];
+    let caught: unknown;
+    try {
+      parseCheckpoint(payload);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(SchemaValidationError);
+    const message = (caught as SchemaValidationError).message;
+    expect(message).toBe(`invalid checkpoint: ${DUPLICATE_EVIDENCE_ERROR_MESSAGE}`);
+    expect(message).not.toContain("c1");
+    expect(message).not.toContain("a1b2c3d5");
+    expect(JSON.stringify(caught)).not.toContain("a1b2c3d5");
+  });
+
+  it("rejects duplicate evidence ids that share the same value", () => {
+    const payload = validApply();
+    const evidence = payload.evidence as Record<string, unknown>;
+    evidence.commits = [
+      { id: "c1", value: "a1b2c3d4" },
+      { id: "c1", value: "a1b2c3d4" },
+    ];
+    expect(() => parseCheckpoint(payload)).toThrow(SchemaValidationError);
+  });
+
+  it("rejects cross-category duplicate evidence ids", () => {
+    const payload = validApply();
+    const evidence = payload.evidence as Record<string, unknown>;
+    evidence.tests = [{ id: "c1", value: "manifest.parser.test.ts" }];
+    expect(() => parseCheckpoint(payload)).toThrow(SchemaValidationError);
+  });
+
+  it("accepts evidence ids that are unique across collections", () => {
+    const payload = validApply();
+    const evidence = payload.evidence as Record<string, unknown>;
+    evidence.tests = [{ id: "t9", value: "manifest.parser.test.ts" }];
+    expect(parseCheckpoint(payload).kind).toBe("apply");
+  });
+
   it("rejects path-like and malformed identifiers", () => {
     const cases: Array<[string, unknown]> = [
       ["host_id containing a slash", "/etc/passwd"],
@@ -683,7 +769,53 @@ describe("parseReceipt", () => {
     expect(parsed.outcome).toBe("rolled_back");
     if (parsed.outcome === "rolled_back") {
       expect(parsed.target_event_id).toBe("evt-0001");
+      expect(parsed.rollback_targets).toEqual([
+        {
+          path: "Notas Diarias/2026-08-11.md",
+          before_hash: sha256("a"),
+          after_hash: null,
+        },
+      ]);
     }
+  });
+
+  it("accepts a deferred receipt carrying planned apply targets", () => {
+    const payload = validDeferredReceipt();
+    payload.targets = [
+      { path: "Proyectos/Atlas.md", before_hash: sha256("b"), after_hash: sha256("c") },
+    ];
+    const parsed = parseReceipt(payload);
+    expect(parsed.outcome).toBe("deferred_conflict");
+    if (parsed.outcome === "deferred_conflict") {
+      expect(parsed.targets).toHaveLength(1);
+    }
+  });
+
+  it("accepts a failed receipt carrying planned apply targets", () => {
+    const payload = validFailedReceipt();
+    payload.targets = [
+      { path: "Notas Diarias/2026-08-11.md", before_hash: null, after_hash: sha256("a") },
+    ];
+    const parsed = parseReceipt(payload);
+    expect(parsed.outcome).toBe("failed");
+    if (parsed.outcome === "failed") {
+      expect(parsed.targets).toHaveLength(1);
+    }
+  });
+
+  it("accepts a rolled-back receipt restoring content (both hashes present)", () => {
+    const payload = validRolledBackReceipt();
+    payload.rollback_targets = [
+      { path: "Proyectos/Atlas.md", before_hash: sha256("c"), after_hash: sha256("b") },
+    ];
+    const parsed = parseReceipt(payload);
+    expect(parsed.outcome).toBe("rolled_back");
+  });
+
+  it("accepts an empty noop receipt without targets", () => {
+    const parsed = parseReceipt(validNoopReceipt());
+    expect(parsed.outcome).toBe("noop");
+    expect("targets" in parsed).toBe(false);
   });
 
   it("returns the exact receipt union type", () => {
@@ -706,6 +838,17 @@ describe("parseReceipt", () => {
       payload.extra = 1;
       expect(() => parseReceipt(payload), label).toThrow(SchemaValidationError);
     }
+    const appliedWithTargetExtra = validAppliedReceipt();
+    const targets = appliedWithTargetExtra.targets as Array<Record<string, unknown>>;
+    targets[0]!.extra = 1;
+    expect(() => parseReceipt(appliedWithTargetExtra)).toThrow(SchemaValidationError);
+
+    const rolledBackWithTargetExtra = validRolledBackReceipt();
+    const rollbackTargets = rolledBackWithTargetExtra.rollback_targets as Array<
+      Record<string, unknown>
+    >;
+    rollbackTargets[0]!.extra = 1;
+    expect(() => parseReceipt(rolledBackWithTargetExtra)).toThrow(SchemaValidationError);
   });
 
   it("rejects malformed receipts", () => {
@@ -790,6 +933,33 @@ describe("parseReceipt", () => {
     const deferredWithAbsoluteProposal = validDeferredReceipt();
     deferredWithAbsoluteProposal.proposal_path = "/tmp/escape.md";
     expect(() => parseReceipt(deferredWithAbsoluteProposal)).toThrow(SchemaValidationError);
+
+    const rolledBackMissingTransitions = validRolledBackReceipt();
+    delete rolledBackMissingTransitions.rollback_targets;
+    expect(() => parseReceipt(rolledBackMissingTransitions)).toThrow(SchemaValidationError);
+
+    const rolledBackEmptyTransitions = validRolledBackReceipt();
+    rolledBackEmptyTransitions.rollback_targets = [];
+    expect(() => parseReceipt(rolledBackEmptyTransitions)).toThrow(SchemaValidationError);
+
+    const rolledBackNullBeforeHash = validRolledBackReceipt();
+    const rollbackTargets = rolledBackNullBeforeHash.rollback_targets as Array<
+      Record<string, unknown>
+    >;
+    rollbackTargets[0]!.before_hash = null;
+    expect(() => parseReceipt(rolledBackNullBeforeHash)).toThrow(SchemaValidationError);
+
+    const deferredWithBadTarget = validDeferredReceipt();
+    deferredWithBadTarget.targets = [
+      { path: "Proyectos/../Atlas.md", before_hash: sha256("b"), after_hash: sha256("c") },
+    ];
+    expect(() => parseReceipt(deferredWithBadTarget)).toThrow(SchemaValidationError);
+
+    const failedWithBadTargetHash = validFailedReceipt();
+    failedWithBadTargetHash.targets = [
+      { path: "Proyectos/Atlas.md", before_hash: sha256("b"), after_hash: "zz" },
+    ];
+    expect(() => parseReceipt(failedWithBadTargetHash)).toThrow(SchemaValidationError);
   });
 });
 
@@ -850,6 +1020,24 @@ describe("parseJournalEvent", () => {
       payload.extra = 1;
       expect(() => parseJournalEvent(payload), kind).toThrow(SchemaValidationError);
     }
+    const applyWithTargetExtra = validJournal("apply");
+    const planned = applyWithTargetExtra.planned_targets as Array<Record<string, unknown>>;
+    planned[0]!.extra = 1;
+    expect(() => parseJournalEvent(applyWithTargetExtra)).toThrow(SchemaValidationError);
+
+    const rollbackWithTargetExtra = validJournal("rollback");
+    const rollbackTargets = rollbackWithTargetExtra.rollback_targets as Array<
+      Record<string, unknown>
+    >;
+    rollbackTargets[0]!.extra = 1;
+    expect(() => parseJournalEvent(rollbackWithTargetExtra)).toThrow(SchemaValidationError);
+  });
+
+  it("accepts a deferred journal event with empty planned targets", () => {
+    const payload = validJournal("deferred");
+    payload.planned_targets = [];
+    const parsed = parseJournalEvent(payload);
+    expect(parsed.kind).toBe("deferred");
   });
 
   it("rejects malformed journal events", () => {
@@ -888,6 +1076,40 @@ describe("parseJournalEvent", () => {
     const missingIdempotencyKey = validJournal("apply");
     delete missingIdempotencyKey.idempotency_key;
     expect(() => parseJournalEvent(missingIdempotencyKey)).toThrow(SchemaValidationError);
+
+    const applyWithoutPlannedTargets = validJournal("apply");
+    delete applyWithoutPlannedTargets.planned_targets;
+    expect(() => parseJournalEvent(applyWithoutPlannedTargets)).toThrow(SchemaValidationError);
+
+    const applyWithEmptyPlannedTargets = validJournal("apply");
+    applyWithEmptyPlannedTargets.planned_targets = [];
+    expect(() => parseJournalEvent(applyWithEmptyPlannedTargets)).toThrow(SchemaValidationError);
+
+    const applyWithAbsolutePlannedPath = validJournal("apply");
+    const plannedTargets = applyWithAbsolutePlannedPath.planned_targets as Array<
+      Record<string, unknown>
+    >;
+    plannedTargets[0]!.path = "/etc/passwd";
+    expect(() => parseJournalEvent(applyWithAbsolutePlannedPath)).toThrow(SchemaValidationError);
+
+    const deferredWithoutPlannedTargets = validJournal("deferred");
+    delete deferredWithoutPlannedTargets.planned_targets;
+    expect(() => parseJournalEvent(deferredWithoutPlannedTargets)).toThrow(SchemaValidationError);
+
+    const rollbackWithoutTransitions = validJournal("rollback");
+    delete rollbackWithoutTransitions.rollback_targets;
+    expect(() => parseJournalEvent(rollbackWithoutTransitions)).toThrow(SchemaValidationError);
+
+    const rollbackWithEmptyTransitions = validJournal("rollback");
+    rollbackWithEmptyTransitions.rollback_targets = [];
+    expect(() => parseJournalEvent(rollbackWithEmptyTransitions)).toThrow(SchemaValidationError);
+
+    const rollbackWithNullBeforeHash = validJournal("rollback");
+    const rollbackTargets = rollbackWithNullBeforeHash.rollback_targets as Array<
+      Record<string, unknown>
+    >;
+    rollbackTargets[0]!.before_hash = null;
+    expect(() => parseJournalEvent(rollbackWithNullBeforeHash)).toThrow(SchemaValidationError);
   });
 
   it("rejects an apply journal event with dangling evidence citations", () => {
@@ -913,6 +1135,34 @@ describe("parseJournalEvent", () => {
     const checkpoint = payload.checkpoint as Record<string, unknown>;
     const knowledge = checkpoint.knowledge as Record<string, unknown>;
     knowledge.completed_tasks = [{ text: "Deferred work", evidence: ["missing-id"] }];
+    expect(() => parseJournalEvent(payload)).toThrow(SchemaValidationError);
+  });
+
+  it("rejects an apply journal event with duplicate evidence ids", () => {
+    const payload = validJournal("apply");
+    const checkpoint = payload.checkpoint as Record<string, unknown>;
+    const evidence = checkpoint.evidence as Record<string, unknown>;
+    evidence.commits = [
+      { id: "c1", value: "a1b2c3d4" },
+      { id: "c1", value: "a1b2c3d4" },
+    ];
+    let caught: unknown;
+    try {
+      parseJournalEvent(payload);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(SchemaValidationError);
+    const message = (caught as SchemaValidationError).message;
+    expect(message).toBe(`invalid checkpoint: ${DUPLICATE_EVIDENCE_ERROR_MESSAGE}`);
+    expect(message).not.toContain("c1");
+  });
+
+  it("rejects a deferred journal event with cross-category duplicate evidence ids", () => {
+    const payload = validJournal("deferred");
+    const checkpoint = payload.checkpoint as Record<string, unknown>;
+    const evidence = checkpoint.evidence as Record<string, unknown>;
+    evidence.files = [{ id: "c1", value: "src/parser.ts" }];
     expect(() => parseJournalEvent(payload)).toThrow(SchemaValidationError);
   });
 

@@ -134,7 +134,9 @@ export type SearchMatchField = (typeof SEARCH_MATCH_FIELDS)[number];
  * persisted, and each outcome kind is correlated to the exact receipt type
  * it produced (`applied` -> {@link AppliedReceipt}, `noop` ->
  * {@link NoopReceipt}, `deferred_conflict` ->
- * {@link DeferredConflictReceipt}, `failed` -> {@link FailedReceipt}).
+ * {@link DeferredConflictReceipt}, `failed` -> {@link FailedReceipt});
+ * apply transitions use {@link ApplyTarget}, rollback transitions use
+ * {@link RollbackTarget}.
  * `already_applied` references the original applied receipt without writing
  * a second one; `rolled_back` stays service-specific (rollback receipts).
  */
@@ -178,10 +180,11 @@ export type {
   KnowledgeItem,
   NoopCheckpoint,
   NoopReceipt,
+  ApplyTarget,
   ProjectRef,
   ProjectResolution,
   Receipt,
-  ReceiptTarget,
+  RollbackTarget,
   RolledBackReceipt,
   SearchHit,
   Targets,

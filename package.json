@@ -19,7 +19,7 @@
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
     "typecheck": "tsc --noEmit",
-    "lint": "biome lint src tests vitest.config.ts",
+    "lint": "biome lint --skip=suspicious/noExplicitAny src tests vitest.config.ts",
     "check:no-any": "node scripts/check-no-any.mjs",
     "check": "npm run typecheck && npm run lint && npm run check:no-any && npm test"
   },
