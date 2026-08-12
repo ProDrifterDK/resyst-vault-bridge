@@ -525,7 +525,7 @@ export async function loadConfig(deps: LoadConfigDeps = {}): Promise<BridgeConfi
   const localConfigFile = path.join(localConfigDir, "config.json");
 
   const localRaw = await readOrAbsent(fs, localConfigFile, "local_config_missing", "local_config_unreadable");
-  if (localRaw.length > MAX_CONFIG_BYTES) {
+  if (Buffer.byteLength(localRaw, "utf8") > MAX_CONFIG_BYTES) {
     throw new ConfigError("local_config_invalid");
   }
   let localValue: unknown;
@@ -549,7 +549,7 @@ export async function loadConfig(deps: LoadConfigDeps = {}): Promise<BridgeConfi
 
   const portableFile = path.join(local.vault_path, ".resyst", "agent-vault.yaml");
   const portableRaw = await readOrAbsent(fs, portableFile, "portable_config_missing", "portable_config_unreadable");
-  if (portableRaw.length > MAX_CONFIG_BYTES) {
+  if (Buffer.byteLength(portableRaw, "utf8") > MAX_CONFIG_BYTES) {
     throw new ConfigError("portable_config_invalid");
   }
   let portableValue: unknown;

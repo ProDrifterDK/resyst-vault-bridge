@@ -1208,6 +1208,61 @@ loop: &loop
     });
   });
 
+  it("rejects a schema-valid local JSON payload under the character limit but over the byte limit", async () => {
+    await withVault(async (ctx) => {
+      // "é" is 2 UTF-8 bytes but 1 UTF-16 code unit. 33 overrides with
+      // 4095-char multibyte paths total ~135k chars (< 262_144) yet ~270k
+      // bytes (> 262_144), and the payload is fully schema-valid: only the
+      // byte gate can reject it.
+      // Paths stay <= 4096 chars for every index (4093 + up to 2 index digits).
+      const overrides = Array.from({ length: 33 }, (_, i) => ({
+        path: `/${"é".repeat(4093)}${i}`,
+        project_id: `atlas-${i}`,
+      }));
+      const payload = JSON.stringify({
+        version: 1,
+        host_id: "workstation",
+        vault_path: ctx.vault.vaultPath,
+        project_overrides: overrides,
+      });
+      expect(payload.length).toBeLessThan(MAX_CONFIG_BYTES);
+      expect(Buffer.byteLength(payload, "utf8")).toBeGreaterThan(MAX_CONFIG_BYTES);
+      await writeFile(ctx.localConfigFile, payload, "utf8");
+      let caught: unknown;
+      try {
+        await load(ctx);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ConfigError);
+      expect((caught as ConfigError).code).toBe("local_config_invalid");
+    });
+  });
+
+  it("rejects a schema-valid portable YAML payload under the character limit but over the byte limit", async () => {
+    await withVault(async (ctx) => {
+      // A 250_000-char multibyte comment keeps the document schema-valid
+      // (~250k chars < 262_144) while pushing it to ~500k bytes (> 262_144);
+      // only the byte gate can reject it.
+      const payload =
+        `version: 1\nlayout:\n  daily_dir: "Notas Diarias"\n  projects_dir: "Proyectos"\n  inbox_dir: "Inbox"\n  templates_dir: "_plantillas"\n` +
+        `# ${"é".repeat(250_000)}\n`;
+      expect(payload.length).toBeLessThan(MAX_CONFIG_BYTES);
+      expect(Buffer.byteLength(payload, "utf8")).toBeGreaterThan(MAX_CONFIG_BYTES);
+      await ctx.vault.writePortableConfig(payload);
+      await writeLocalConfig(ctx, { version: 1, host_id: "workstation", vault_path: ctx.vault.vaultPath });
+      let caught: unknown;
+      try {
+        await load(ctx);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ConfigError);
+      expect((caught as ConfigError).code).toBe("portable_config_invalid");
+    });
+  });
+
+
   it("rejects YAML documents whose alias expansion exceeds the alias budget", async () => {
     await withVault(async (ctx) => {
       let portable = `version: 1
