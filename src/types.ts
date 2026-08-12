@@ -9,7 +9,12 @@
  * compile-time markers whose runtime guarantees come from the schema
  * patterns applied in `src/schemas.ts`.
  */
-import type { AppliedReceipt, Receipt } from "./schemas.js";
+import type {
+  AppliedReceipt,
+  DeferredConflictReceipt,
+  FailedReceipt,
+  NoopReceipt,
+} from "./schemas.js";
 
 /** Protocol version accepted by this bridge release. */
 export const PROTOCOL_VERSION = 1 as const;
@@ -32,7 +37,11 @@ export type EventId = string & { readonly __eventId: unique symbol };
 /** Opaque evidence identifier cited by knowledge items. */
 export type EvidenceId = string & { readonly __evidenceId: unique symbol };
 
-/** Opaque canonical key that makes journal events and receipts idempotent. */
+/**
+ * Idempotency key: SHA-256 of the canonical checkpoint data (Task 7),
+ * exactly 64 lowercase hex characters, making journal events and receipts
+ * idempotent.
+ */
 export type IdempotencyKey = string & { readonly __idempotencyKey: unique symbol };
 
 /** Vault-relative POSIX note path; never absolute, never traverses upward. */
@@ -122,14 +131,22 @@ export type SearchMatchField = (typeof SEARCH_MATCH_FIELDS)[number];
 
 /**
  * Outcome of a checkpoint evaluation. A pure result type: only receipts are
- * persisted; `already_applied` references the original applied receipt
- * without writing a second one.
+ * persisted, and each outcome kind is correlated to the exact receipt type
+ * it produced (`applied` -> {@link AppliedReceipt}, `noop` ->
+ * {@link NoopReceipt}, `deferred_conflict` ->
+ * {@link DeferredConflictReceipt}, `failed` -> {@link FailedReceipt}).
+ * `already_applied` references the original applied receipt without writing
+ * a second one; `rolled_back` stays service-specific (rollback receipts).
  */
 export type CheckpointOutcome =
-  | { kind: "applied"; event_id: EventId; receipt: Receipt }
-  | { kind: "noop"; event_id: EventId; receipt: Receipt; reason: NoopReason }
-  | { kind: "deferred_conflict"; event_id: EventId; receipt: Receipt }
-  | { kind: "failed"; event_id: EventId; receipt: Receipt }
+  | { kind: "applied"; event_id: EventId; receipt: AppliedReceipt }
+  | { kind: "noop"; event_id: EventId; receipt: NoopReceipt; reason: NoopReason }
+  | {
+      kind: "deferred_conflict";
+      event_id: EventId;
+      receipt: DeferredConflictReceipt;
+    }
+  | { kind: "failed"; event_id: EventId; receipt: FailedReceipt }
   | {
       kind: "already_applied";
       idempotency_key: IdempotencyKey;
@@ -147,20 +164,25 @@ export type CheckpointOutcome =
 // ---------------------------------------------------------------------------
 export type {
   ApplyCheckpoint,
+  AppliedReceipt,
   BootstrapFragment,
   BootstrapResult,
   CheckpointRequest,
   CheckpointSource,
+  DeferredConflictReceipt,
   Evidence,
   EvidenceItem,
+  FailedReceipt,
   JournalEvent,
   Knowledge,
   KnowledgeItem,
   NoopCheckpoint,
+  NoopReceipt,
   ProjectRef,
   ProjectResolution,
   Receipt,
   ReceiptTarget,
+  RolledBackReceipt,
   SearchHit,
   Targets,
 } from "./schemas.js";

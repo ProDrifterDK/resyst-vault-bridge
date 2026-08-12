@@ -11,10 +11,17 @@ import {
 } from "../../src/schemas.js";
 import type {
   ApplyCheckpoint,
+  AppliedReceipt,
   BootstrapResult,
+  CheckpointOutcome,
   CheckpointRequest,
+  DeferredConflictReceipt,
+  EventId,
+  FailedReceipt,
+  IdempotencyKey,
   JournalEvent,
   NoopCheckpoint,
+  NoopReceipt,
   ProjectResolution,
   Receipt,
   SearchHit,
@@ -58,12 +65,17 @@ function validNoop(reason: string): Record<string, unknown> {
 
 const sha256 = (char: string) => char.repeat(64);
 
+/** Deterministic 64-char lowercase hex fixture for SHA-256-shaped keys. */
+function fixtureHash(seed: number): string {
+  return seed.toString(16).padEnd(64, "0");
+}
+
 function validAppliedReceipt(): Record<string, unknown> {
   return {
     version: 1,
     outcome: "applied",
     event_id: "evt-0001",
-    idempotency_key: "idem-0001",
+    idempotency_key: fixtureHash(1),
     targets: [
       {
         path: "Notas Diarias/2026-08-11.md",
@@ -85,7 +97,7 @@ function validNoopReceipt(): Record<string, unknown> {
     version: 1,
     outcome: "noop",
     event_id: "evt-0002",
-    idempotency_key: "idem-0002",
+    idempotency_key: fixtureHash(2),
     created_at: "2026-08-11T09:31:00.000Z",
   };
 }
@@ -95,7 +107,7 @@ function validDeferredReceipt(): Record<string, unknown> {
     version: 1,
     outcome: "deferred_conflict",
     event_id: "evt-0003",
-    idempotency_key: "idem-0003",
+    idempotency_key: fixtureHash(3),
     proposal_path: "Inbox/proposal-evt-0003.md",
     conflict_paths: ["Notas Diarias/2026-08-11.md"],
     created_at: "2026-08-11T09:32:00.000Z",
@@ -107,7 +119,7 @@ function validFailedReceipt(reason = "precondition_mismatch"): Record<string, un
     version: 1,
     outcome: "failed",
     event_id: "evt-0004",
-    idempotency_key: "idem-0004",
+    idempotency_key: fixtureHash(4),
     reason,
     created_at: "2026-08-11T09:33:00.000Z",
   };
@@ -118,7 +130,7 @@ function validRolledBackReceipt(): Record<string, unknown> {
     version: 1,
     outcome: "rolled_back",
     event_id: "evt-0005",
-    idempotency_key: "idem-0005",
+    idempotency_key: fixtureHash(5),
     target_event_id: "evt-0001",
     created_at: "2026-08-11T09:34:00.000Z",
   };
@@ -129,7 +141,7 @@ function validJournal(kind: string): Record<string, unknown> {
     version: 1,
     kind,
     event_id: "evt-0101",
-    idempotency_key: "idem-0101",
+    idempotency_key: fixtureHash(101),
     created_at: "2026-08-11T09:35:00.000Z",
   };
   switch (kind) {
@@ -634,7 +646,7 @@ describe("parseReceipt", () => {
     expect(parsed.outcome).toBe("applied");
     if (parsed.outcome === "applied") {
       expect(parsed.event_id).toBe("evt-0001");
-      expect(parsed.idempotency_key).toBe("idem-0001");
+      expect(parsed.idempotency_key).toBe(fixtureHash(1));
       expect(parsed.targets).toEqual([
         { path: "Notas Diarias/2026-08-11.md", before_hash: null, after_hash: sha256("a") },
         { path: "Proyectos/Atlas.md", before_hash: sha256("b"), after_hash: sha256("c") },
@@ -722,6 +734,11 @@ describe("parseReceipt", () => {
     targets5[0]!.path = "/etc/passwd";
     expect(() => parseReceipt(withAbsolutePath)).toThrow(SchemaValidationError);
 
+    const withTrailingSlash = validAppliedReceipt();
+    const targets6 = withTrailingSlash.targets as Array<Record<string, unknown>>;
+    targets6[0]!.path = "Notas Diarias/2026-08-11.md/";
+    expect(() => parseReceipt(withTrailingSlash)).toThrow(SchemaValidationError);
+
     const withEmptyTargets = validAppliedReceipt();
     withEmptyTargets.targets = [];
     expect(() => parseReceipt(withEmptyTargets)).toThrow(SchemaValidationError);
@@ -733,6 +750,18 @@ describe("parseReceipt", () => {
     const withBadIdempotencyKey = validAppliedReceipt();
     withBadIdempotencyKey.idempotency_key = "../idem";
     expect(() => parseReceipt(withBadIdempotencyKey)).toThrow(SchemaValidationError);
+
+    const withUppercaseIdempotencyKey = validAppliedReceipt();
+    withUppercaseIdempotencyKey.idempotency_key = "A".repeat(64);
+    expect(() => parseReceipt(withUppercaseIdempotencyKey)).toThrow(SchemaValidationError);
+
+    const withShortIdempotencyKey = validAppliedReceipt();
+    withShortIdempotencyKey.idempotency_key = "ab".repeat(31);
+    expect(() => parseReceipt(withShortIdempotencyKey)).toThrow(SchemaValidationError);
+
+    const withNonHexIdempotencyKey = validAppliedReceipt();
+    withNonHexIdempotencyKey.idempotency_key = "z".repeat(64);
+    expect(() => parseReceipt(withNonHexIdempotencyKey)).toThrow(SchemaValidationError);
 
     const missingIdempotencyKey = validAppliedReceipt();
     delete missingIdempotencyKey.idempotency_key;
@@ -770,7 +799,7 @@ describe("parseJournalEvent", () => {
     expect(parsed.kind).toBe("apply");
     if (parsed.kind === "apply") {
       expect(parsed.checkpoint.kind).toBe("apply");
-      expect(parsed.idempotency_key).toBe("idem-0101");
+      expect(parsed.idempotency_key).toBe(fixtureHash(101));
     }
   });
 
@@ -859,6 +888,46 @@ describe("parseJournalEvent", () => {
     const missingIdempotencyKey = validJournal("apply");
     delete missingIdempotencyKey.idempotency_key;
     expect(() => parseJournalEvent(missingIdempotencyKey)).toThrow(SchemaValidationError);
+  });
+
+  it("rejects an apply journal event with dangling evidence citations", () => {
+    const payload = validJournal("apply");
+    const checkpoint = payload.checkpoint as Record<string, unknown>;
+    const knowledge = checkpoint.knowledge as Record<string, unknown>;
+    knowledge.completed_tasks = [{ text: "Work", evidence: ["ghost-id"] }];
+    let caught: unknown;
+    try {
+      parseJournalEvent(payload);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(SchemaValidationError);
+    const message = (caught as SchemaValidationError).message;
+    expect(message).toBe(`invalid checkpoint: ${EVIDENCE_CITATION_ERROR_MESSAGE}`);
+    expect(message).not.toContain("ghost-id");
+    expect(message).not.toContain("Work");
+  });
+
+  it("rejects a deferred journal event with dangling evidence citations", () => {
+    const payload = validJournal("deferred");
+    const checkpoint = payload.checkpoint as Record<string, unknown>;
+    const knowledge = checkpoint.knowledge as Record<string, unknown>;
+    knowledge.completed_tasks = [{ text: "Deferred work", evidence: ["missing-id"] }];
+    expect(() => parseJournalEvent(payload)).toThrow(SchemaValidationError);
+  });
+
+  it("accepts journal events whose evidence citations all resolve", () => {
+    const payload = validJournal("apply");
+    const checkpoint = payload.checkpoint as Record<string, unknown>;
+    const knowledge = checkpoint.knowledge as Record<string, unknown>;
+    knowledge.completed_tasks = [{ text: "Work", evidence: ["t1"] }];
+    const parsed = parseJournalEvent(payload);
+    expect(parsed.kind).toBe("apply");
+    const deferred = validJournal("deferred");
+    const deferredCheckpoint = deferred.checkpoint as Record<string, unknown>;
+    const deferredKnowledge = deferredCheckpoint.knowledge as Record<string, unknown>;
+    deferredKnowledge.decisions = [{ text: "Decision", evidence: ["c1", "f1"] }];
+    expect(parseJournalEvent(deferred).kind).toBe("deferred");
   });
 });
 
@@ -1041,6 +1110,29 @@ describe("parseSearchHit", () => {
     expect(() => parseSearchHit(payload)).toThrow(SchemaValidationError);
   });
 
+  it("rejects unsafe paths at the public parser boundary", () => {
+    const unsafePaths = [
+      "Proyectos/", // trailing slash
+      "Proyectos//Atlas.md", // doubled slash
+      "Proyectos/./Atlas.md", // dot segment
+      "Proyectos/../Atlas.md", // dotdot segment
+      "Proyectos\\Atlas.md", // backslash
+      "/Proyectos/Atlas.md", // absolute
+      "Proyectos/Atlas\t.md", // control character
+      "Proyectos/Atlas\u0000.md", // NUL byte
+    ];
+    for (const unsafePath of unsafePaths) {
+      const payload = validSearchHit();
+      payload.path = unsafePath;
+      expect(() => parseSearchHit(payload), unsafePath).toThrow(
+        SchemaValidationError,
+      );
+    }
+    const payload = validSearchHit();
+    payload.path = "Proyectos/Atlas/Notas 2026.md";
+    expect(parseSearchHit(payload).path).toBe("Proyectos/Atlas/Notas 2026.md");
+  });
+
   it("rejects malformed search hits", () => {
     const badMatchField = validSearchHit();
     badMatchField.matched_on = ["body"];
@@ -1065,5 +1157,104 @@ describe("parseSearchHit", () => {
     const backslashPath = validSearchHit();
     backslashPath.path = "Proyectos\\Atlas.md";
     expect(() => parseSearchHit(backslashPath)).toThrow(SchemaValidationError);
+  });
+});
+
+describe("CheckpointOutcome receipt correlation", () => {
+  /** Narrow a parsed receipt to one exact variant, failing the fixture otherwise. */
+  function expectVariant<O extends Receipt["outcome"]>(
+    receipt: Receipt,
+    outcome: O,
+  ): Extract<Receipt, { outcome: O }> {
+    if (receipt.outcome !== outcome) {
+      throw new Error(`fixture expected a ${outcome} receipt`);
+    }
+    return receipt as Extract<Receipt, { outcome: O }>;
+  }
+
+  it("accepts each kind with its exact receipt type", () => {
+    const appliedReceipt: AppliedReceipt = expectVariant(
+      parseReceipt(validAppliedReceipt()),
+      "applied",
+    );
+    const noopReceipt: NoopReceipt = expectVariant(
+      parseReceipt(validNoopReceipt()),
+      "noop",
+    );
+    const deferredReceipt: DeferredConflictReceipt = expectVariant(
+      parseReceipt(validDeferredReceipt()),
+      "deferred_conflict",
+    );
+    const failedReceipt: FailedReceipt = expectVariant(
+      parseReceipt(validFailedReceipt()),
+      "failed",
+    );
+    const eventId = "evt-0001" as EventId;
+    const outcomes = [
+      { kind: "applied", event_id: eventId, receipt: appliedReceipt },
+      { kind: "noop", event_id: eventId, receipt: noopReceipt, reason: "trivial" },
+      { kind: "deferred_conflict", event_id: eventId, receipt: deferredReceipt },
+      { kind: "failed", event_id: eventId, receipt: failedReceipt },
+      {
+        kind: "already_applied",
+        idempotency_key: fixtureHash(7) as IdempotencyKey,
+        original_event_id: eventId,
+        original_receipt: appliedReceipt,
+      },
+      { kind: "invalid", reason: "schema_rejected" },
+    ] satisfies CheckpointOutcome[];
+    expect(outcomes).toHaveLength(6);
+    expect(outcomes[0]).toMatchObject({ kind: "applied" });
+  });
+
+  it("rejects mismatched kind/receipt combinations at compile time", () => {
+    const appliedReceipt: AppliedReceipt = expectVariant(
+      parseReceipt(validAppliedReceipt()),
+      "applied",
+    );
+    const noopReceipt: NoopReceipt = expectVariant(
+      parseReceipt(validNoopReceipt()),
+      "noop",
+    );
+    const deferredReceipt: DeferredConflictReceipt = expectVariant(
+      parseReceipt(validDeferredReceipt()),
+      "deferred_conflict",
+    );
+    const failedReceipt: FailedReceipt = expectVariant(
+      parseReceipt(validFailedReceipt()),
+      "failed",
+    );
+    const eventId = "evt-0001" as EventId;
+    const appliedWithNoopReceipt: CheckpointOutcome = {
+      kind: "applied",
+      event_id: eventId,
+      // @ts-expect-error applied requires AppliedReceipt, not NoopReceipt
+      receipt: noopReceipt,
+    };
+    const noopWithDeferredReceipt: CheckpointOutcome = {
+      kind: "noop",
+      event_id: eventId,
+      // @ts-expect-error noop requires NoopReceipt, not DeferredConflictReceipt
+      receipt: deferredReceipt,
+      reason: "trivial",
+    };
+    const deferredWithFailedReceipt: CheckpointOutcome = {
+      kind: "deferred_conflict",
+      event_id: eventId,
+      // @ts-expect-error deferred_conflict requires DeferredConflictReceipt, not FailedReceipt
+      receipt: failedReceipt,
+    };
+    const failedWithAppliedReceipt: CheckpointOutcome = {
+      kind: "failed",
+      event_id: eventId,
+      // @ts-expect-error failed requires FailedReceipt, not AppliedReceipt
+      receipt: appliedReceipt,
+    };
+    expect([
+      appliedWithNoopReceipt,
+      noopWithDeferredReceipt,
+      deferredWithFailedReceipt,
+      failedWithAppliedReceipt,
+    ]).toBeDefined();
   });
 });

@@ -103,7 +103,7 @@ export const ID_PATTERN = "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$";
  * Deep containment and symlink checks happen in the path layer
  * (`src/paths.ts`) before filesystem access.
  */
-export const VAULT_PATH_PATTERN = String.raw`^(?!.*(?:^|/)\.\.?(?:/|$))(?!.*//)(?!/$)(?![\\/])[^\\/\u0000-\u001F\u007F][^\\\u0000-\u001F\u007F]{0,1023}$`;
+export const VAULT_PATH_PATTERN = String.raw`^(?!.*(?:^|/)\.\.?(?:/|$))(?!.*//)(?!.*/$)(?![\\/])[^\\/\u0000-\u001F\u007F][^\\\u0000-\u001F\u007F]{0,1023}$`;
 
 export const VersionSchema = Type.Literal(1);
 
@@ -137,8 +137,19 @@ export const EvidenceIdSchema = Codec(
   .Decode((value: string): EvidenceId => value as EvidenceId)
   .Encode((value: EvidenceId): string => value);
 
+/** Exact lowercase hex SHA-256 shape shared by hashes and idempotency keys. */
+export const SHA256_HEX_PATTERN = "^[0-9a-f]{64}$";
+
+/**
+ * Idempotency key: SHA-256 of the canonical checkpoint data (Task 7),
+ * exactly 64 lowercase hex characters.
+ */
 export const IdempotencyKeySchema = Codec(
-  Type.String({ minLength: 8, maxLength: 128, pattern: ID_PATTERN }),
+  Type.String({
+    minLength: 64,
+    maxLength: 64,
+    pattern: SHA256_HEX_PATTERN,
+  }),
 )
   .Decode((value: string): IdempotencyKey => value as IdempotencyKey)
   .Encode((value: IdempotencyKey): string => value);
@@ -150,7 +161,7 @@ export const VaultPathSchema = Codec(
   .Encode((value: VaultPath): string => value);
 
 export const HashHexSchema = Codec(
-  Type.String({ pattern: "^[0-9a-f]{64}$" }),
+  Type.String({ pattern: SHA256_HEX_PATTERN }),
 )
   .Decode((value: string): HashHex => value as HashHex)
   .Encode((value: HashHex): string => value);
@@ -623,9 +634,19 @@ export function parseReceipt(value: unknown): Receipt {
   return parseWithSchema(ReceiptSchema, value, "receipt");
 }
 
-/** Parse a journal event or throw a redacted validation error. */
+/**
+ * Parse a journal event or throw a redacted validation error.
+ * Journal kinds that carry an apply checkpoint (`apply`, `deferred`) run the
+ * same evidence-citation semantic validation as `parseCheckpoint` after
+ * schema parsing, so dangling citations are rejected everywhere a checkpoint
+ * can be persisted.
+ */
 export function parseJournalEvent(value: unknown): JournalEvent {
-  return parseWithSchema(JournalEventSchema, value, "journal event");
+  const event = parseWithSchema(JournalEventSchema, value, "journal event");
+  if (event.kind === "apply" || event.kind === "deferred") {
+    assertKnownEvidenceCitations(event.checkpoint);
+  }
+  return event;
 }
 
 /** Parse a project resolution or throw a redacted validation error. */
