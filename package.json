@@ -12,7 +12,7 @@
   },
   "pi": {
     "extensions": [
-      "./dist/extension/index.js"
+      "./src/extension/index.ts"
     ]
   },
   "scripts": {
