@@ -1,3 +1,6 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { BridgeConfig } from "../../src/config.js";
 import {
@@ -6,6 +9,7 @@ import {
   normalizeRemote,
   parseRemoteV,
   MAX_LEXICAL_CANDIDATES,
+  nodeProjectFs,
   resolveProject,
   resolveProjectWithCandidates,
   type GitRunner,
@@ -42,12 +46,15 @@ function memoryFs(files: MemoryFile[], cwdPaths: string[] = []): ProjectFs {
     }
   }
   return {
-    async readFile(filePath) {
+    async readFileBounded(filePath, maxBytes) {
       const source = fileMap.get(filePath);
       if (source === undefined) {
         const error = new Error("missing") as NodeJS.ErrnoException;
         error.code = "ENOENT";
         throw error;
+      }
+      if (Buffer.byteLength(source, "utf8") > maxBytes) {
+        throw new Error("bounded read overflow");
       }
       return source;
     },
@@ -180,7 +187,7 @@ function boundaryFs(
     lstat: async (filePath: string) =>
       options.lstat?.(filePath) ?? options.stat?.(filePath) ?? defaultSyntheticStat(filePath),
     realpath: options.realpath ?? base.realpath,
-  } as unknown as ProjectFs;
+  };
 }
 
 describe("normalizeRemote", () => {
@@ -470,7 +477,7 @@ describe("unresolved, ambiguity, bounds, and association proposals", () => {
     );
     const fs: ProjectFs = {
       ...base,
-      readFile: async () => {
+      readFileBounded: async () => {
         const error = new Error("secret /vault/Atlas") as NodeJS.ErrnoException;
         error.code = "EACCES";
         throw error;
@@ -523,14 +530,7 @@ describe("unresolved, ambiguity, bounds, and association proposals", () => {
       { kind: "ambiguous", candidates: ["/secret/vault/Atlas.md" as VaultPath] },
       "2026-08-11T12:00:00.000Z" as IsoTimestamp,
     );
-    expect(proposal).toEqual({
-      version: 1,
-      kind: "association",
-      resolution: { kind: "ambiguous", candidates: [] },
-      candidates: [],
-      daily_write_only: true,
-      created_at: "2026-08-11T12:00:00.000Z",
-    });
+    expect(proposal).toBeNull();
   });
 });
 
@@ -562,27 +562,50 @@ describe("association proposal runtime boundary", () => {
     ).toBeNull();
   });
 
-  it("sanitizes paths and mirrors the exact safe list inside ambiguity", () => {
-    const input = {
-      kind: "ambiguous",
-      candidates: [
-        "Projects/Atlas.md",
-        "Projects/Atlas.md",
-        "/secret/Atlas.md",
-        "../escape.md",
-        "Projects/Bad\u0000.md",
-        "Projects/Other.txt",
-      ],
+  it("rejects absolute, traversal, control, and underfilled ambiguous paths", () => {
+    const malformedInputs = [
+      ["Projects/Atlas.md", "/secret/Atlas.md"],
+      ["Projects/Atlas.md", "../escape.md"],
+      ["Projects/Atlas.md", "Projects/Bad\u0000.md"],
+      ["Projects/Atlas.md", "Projects/Atlas.md"],
+      ["Projects/Atlas.md", "Projects/Other.txt"],
+      ["/secret/Atlas.md"],
+    ];
+    for (const candidates of malformedInputs) {
+      const input = {
+        kind: "ambiguous",
+        candidates,
+      } as unknown as Parameters<typeof buildAssociationProposal>[0];
+      expect(buildAssociationProposal(input, timestamp)).toBeNull();
+    }
+  });
+
+  it("rejects malformed unresolved candidate items instead of dropping them", () => {
+    const wrapper = {
+      resolution: { kind: "unresolved", reason: "no_match" },
+      lexical_candidates: [{ path: "/secret/Atlas.md" }],
     } as unknown as Parameters<typeof buildAssociationProposal>[0];
-    const proposal = buildAssociationProposal(input, timestamp);
-    expect(proposal).toEqual({
-      version: 1,
-      kind: "association",
-      resolution: { kind: "ambiguous", candidates: ["Projects/Atlas.md"] },
-      candidates: ["Projects/Atlas.md"],
-      daily_write_only: true,
-      created_at: timestamp,
-    });
+    expect(buildAssociationProposal(wrapper, timestamp)).toBeNull();
+    const extraWrapper = {
+      resolution: { kind: "unresolved", reason: "no_match" },
+      lexical_candidates: [],
+      attacker: "copied?",
+    } as unknown as Parameters<typeof buildAssociationProposal>[0];
+    expect(buildAssociationProposal(extraWrapper, timestamp)).toBeNull();
+    expect(
+      buildAssociationProposal(
+        { kind: "unresolved", reason: "no_match" },
+        timestamp,
+        ["../escape.md" as VaultPath],
+      ),
+    ).toBeNull();
+    expect(
+      buildAssociationProposal(
+        { kind: "unresolved", reason: "no_match" },
+        timestamp,
+        "Projects/Atlas.md" as unknown as readonly VaultPath[],
+      ),
+    ).toBeNull();
   });
 
   it("rejects oversized direct candidate arrays before materialization", () => {
@@ -603,6 +626,27 @@ describe("association proposal runtime boundary", () => {
       candidates: huge,
     } as unknown as Parameters<typeof buildAssociationProposal>[0];
     expect(buildAssociationProposal(ambiguous, timestamp)).toBeNull();
+  });
+});
+
+describe("production bounded project adapter", () => {
+  it("measures UTF-8 bytes and rejects max+1 without unbounded allocation", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "resyst-project-bounded-"));
+    const filePath = path.join(root, "note.md");
+    try {
+      await writeFile(filePath, "éa", "utf8"); // 3 bytes, 2 JS characters.
+      await expect(nodeProjectFs.readFileBounded(filePath, 3)).resolves.toBe("éa");
+      await expect(nodeProjectFs.readFileBounded(filePath, 2)).rejects.toBeDefined();
+      await expect(
+        nodeProjectFs.readFileBounded(filePath, TEST_MAX_NOTE_BYTES + 1),
+      ).rejects.toBeDefined();
+      await writeFile(filePath, "abc", "utf8");
+      await expect(nodeProjectFs.readFileBounded(filePath, 3)).resolves.toBe("abc");
+      await writeFile(filePath, "abcd", "utf8");
+      await expect(nodeProjectFs.readFileBounded(filePath, 3)).rejects.toBeDefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -656,9 +700,9 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
         if (filePath === "/vault/Proyectos") return [dirent("Injected.md", false)];
         return base.readdir(filePath);
       },
-      async readFile(filePath) {
+      async readFileBounded(filePath, maxBytes) {
         if (filePath === "/vault/Proyectos/Injected.md") return "# Injected\n";
-        return base.readFile(filePath);
+        return base.readFileBounded(filePath, maxBytes);
       },
     }, {
       realpath: async (filePath) => {
@@ -725,6 +769,33 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
       resolution: { kind: "unresolved", reason: "unreadable" },
       lexical_candidates: [],
     });
+  });
+
+  it("uses the bounded max+1 note-read seam and rejects overflow", async () => {
+    const base = memoryFs(
+      [{ path: "/vault/Proyectos/Atlas.md", source: "# Atlas\n" }],
+      ["/workspace/atlas"],
+    );
+    let boundedCalls = 0;
+    const fs = boundaryFs({
+      ...base,
+      readFileBounded: async (_filePath, maxBytes) => {
+        boundedCalls += 1;
+        expect(maxBytes).toBe(TEST_MAX_NOTE_BYTES);
+        throw new Error("bounded max+1 overflow");
+      },
+    });
+    const outcome = await resolveProjectWithCandidates({
+      cwd: "/workspace/atlas",
+      config: config(),
+      fs,
+      git: async () => ({ ok: true, stdout: "", stderr: "" }),
+    });
+    expect(outcome).toEqual({
+      resolution: { kind: "unresolved", reason: "unreadable" },
+      lexical_candidates: [],
+    });
+    expect(boundedCalls).toBe(1);
   });
 
   it("invalidates the complete scan on an oversized note after a valid note", async () => {
@@ -899,6 +970,74 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
     expect(outcome.resolution).toEqual({
       kind: "resolved",
       project_id: "Atlas-Project",
+      basis: "exact_name",
+      note_path: "Proyectos/Report.md",
+    });
+  });
+
+  it("fails closed when one note has conflicting exact title and heading ids", async () => {
+    const fs = boundaryFs(
+      memoryFs(
+        [{
+          path: "/vault/Proyectos/Report.md",
+          source: "---\ntitle: Atlas\n---\n# atlas\n",
+        }],
+        ["/workspace/atlas"],
+      ),
+    );
+    const outcome = await resolveProjectWithCandidates({
+      cwd: "/workspace/atlas",
+      config: config(),
+      fs,
+      git: async () => ({ ok: true, stdout: "", stderr: "" }),
+    });
+    expect(outcome.resolution).toEqual({ kind: "unresolved", reason: "unreadable" });
+  });
+
+  it("does not let a safe note mask conflicting exact ids in another note", async () => {
+    const fs = boundaryFs(
+      memoryFs(
+        [
+          {
+            path: "/vault/Proyectos/Conflict.md",
+            source: "---\ntitle: Atlas\n---\n# atlas\n",
+          },
+          {
+            path: "/vault/Proyectos/Safe.md",
+            source: "---\ntitle: Atlas\n---\n# Safe\n",
+          },
+        ],
+        ["/workspace/atlas"],
+      ),
+    );
+    const outcome = await resolveProjectWithCandidates({
+      cwd: "/workspace/atlas",
+      config: config(),
+      fs,
+      git: async () => ({ ok: true, stdout: "", stderr: "" }),
+    });
+    expect(outcome.resolution).toEqual({ kind: "unresolved", reason: "unreadable" });
+  });
+
+  it("prefers a portable id over an unsafe exact legacy value", async () => {
+    const fs = boundaryFs(
+      memoryFs(
+        [{
+          path: "/vault/Proyectos/Report.md",
+          source: "---\nresyst_project:\n  id: atlas\ntitle: 🔥\n---\n# Report\n",
+        }],
+        ["/workspace/🔥"],
+      ),
+    );
+    const outcome = await resolveProjectWithCandidates({
+      cwd: "/workspace/🔥",
+      config: config(),
+      fs,
+      git: async () => ({ ok: true, stdout: "", stderr: "" }),
+    });
+    expect(outcome.resolution).toEqual({
+      kind: "resolved",
+      project_id: "atlas",
       basis: "exact_name",
       note_path: "Proyectos/Report.md",
     });
