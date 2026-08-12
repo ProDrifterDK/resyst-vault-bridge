@@ -358,12 +358,14 @@ function narrowMetadata(raw: unknown): NoteMetadata {
   }
   const record = raw as Record<string, unknown>;
   const title = record["title"];
-  if (typeof title === "string") {
-    metadata.title = title;
+  if (typeof title === "string" && title.length > 0) {
+    metadata.title =
+      title.length <= MAX_FRONTMATTER_STRING_LENGTH ? title : null;
   }
   const date = record["date"];
-  if (typeof date === "string") {
-    metadata.date = date;
+  if (typeof date === "string" && date.length > 0) {
+    metadata.date =
+      date.length <= MAX_FRONTMATTER_STRING_LENGTH ? date : null;
   }
   metadata.tags = narrowStringList(record["tags"]);
   metadata.aliases = narrowStringList(record["aliases"]);
@@ -428,7 +430,9 @@ function narrowRequiredStringArray(value: unknown): string[] | null {
  */
 function narrowStringList(value: unknown): string[] {
   if (typeof value === "string") {
-    return value.length <= MAX_FRONTMATTER_STRING_LENGTH ? [value] : [];
+    return value.length > 0 && value.length <= MAX_FRONTMATTER_STRING_LENGTH
+      ? [value]
+      : [];
   }
   if (!Array.isArray(value)) {
     return [];
@@ -755,7 +759,7 @@ function parseWikilink(
  * content inside the span). An unmatched opening run is literal text, so no
  * region is produced. Single linear pass per line.
  */
-function inlineCodeRegions(text: string, base: number): Array<{ start: number; end: number }> {
+function inlineCodeRegions(text: string): Array<{ start: number; end: number }> {
   const regions: Array<{ start: number; end: number }> = [];
   const len = text.length;
   let openRun = -1;
@@ -774,7 +778,7 @@ function inlineCodeRegions(text: string, base: number): Array<{ start: number; e
       openRun = run;
       openPos = i;
     } else if (run === openRun) {
-      regions.push({ start: base + openPos, end: base + i + run });
+      regions.push({ start: openPos, end: i + run });
       openRun = -1;
       openPos = -1;
     }
@@ -854,6 +858,31 @@ function scanLineLinks(
   return links;
 }
 
+/** Region of excluded source bytes. */
+interface ExcludedRegion {
+  start: number;
+  end: number;
+}
+
+/** Sort by (start, end) and merge overlapping/adjacent excluded regions. */
+function sortAndCoalesce(regions: ExcludedRegion[]): ExcludedRegion[] {
+  const sorted = [...regions].sort(
+    (a, b) => a.start - b.start || a.end - b.end,
+  );
+  const out: ExcludedRegion[] = [];
+  for (const region of sorted) {
+    const last = out[out.length - 1];
+    if (last && region.start <= last.end) {
+      if (region.end > last.end) {
+        last.end = region.end;
+      }
+    } else {
+      out.push({ start: region.start, end: region.end });
+    }
+  }
+  return out;
+}
+
 /**
  * Scan for well-formed `[[...]]` wikilinks with bounded monotonic logic:
  * excluded whole-line regions (frontmatter, fences, indented code) are
@@ -879,7 +908,7 @@ function scanWikilinks(
     ) {
       continue;
     }
-    links.push(...scanLineLinks(line.text, line.start, inlineCodeRegions(line.text, line.start)));
+    links.push(...scanLineLinks(line.text, line.start, inlineCodeRegions(line.text)));
   }
   return links;
 }
@@ -898,11 +927,14 @@ export function parseNote(source: string): ParsedNote {
   // managed markers even when its YAML body fails to parse.
   const frontmatterRegion = findFrontmatterRegion(lines);
   const scan = scanDocument(source, lines, frontmatterRegion);
-  const excluded: Array<{ start: number; end: number }> = [
+  // Fences, indented lines, and frontmatter are each ordered internally but
+  // not globally; sort and coalesce by (start, end) once so the monotonic
+  // region cursor in the wikilink scanner never skips a live region.
+  const excluded = sortAndCoalesce([
     ...scan.fences,
     ...scan.indented,
     ...(frontmatterRegion ? [frontmatterRegion] : []),
-  ];
+  ]);
   const wikilinks = scanWikilinks(lines, excluded);
   return {
     source,
@@ -1021,7 +1053,14 @@ function containsMarkerLikeText(text: string): boolean {
  */
 function normalizeBody(body: string, eol: "\n" | "\r\n" | "\r"): string {
   const normalized = body.replace(/\r\n|\r|\n/g, eol);
-  return normalized.endsWith(eol) ? normalized : `${normalized}${eol}`;
+  // Strip every trailing document-EOL sequence, then append exactly one, so
+  // a body can never carry multiple (or mixed) trailing breaks while
+  // intentional internal blank lines are preserved.
+  let trimmed = normalized;
+  while (trimmed.endsWith(eol)) {
+    trimmed = trimmed.slice(0, trimmed.length - eol.length);
+  }
+  return `${trimmed}${eol}`;
 }
 
 /**

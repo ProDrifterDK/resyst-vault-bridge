@@ -1388,3 +1388,242 @@ describe("wikilink scan bound", () => {
     expect(Date.now() - started).toBeLessThan(4000);
   });
 });
+
+
+describe("exclusion region ordering", () => {
+  it("excludes frontmatter wikilinks even when a later fence exists", () => {
+    const source = [
+      "---",
+      "title: atlas",
+      "[[FakeInFrontmatter]]",
+      "---",
+      "# Nota",
+      "",
+      "```",
+      "[[FakeInFence]]",
+      "```",
+      "",
+      "[[Real]]",
+      "",
+    ].join("\n");
+    const note = parse(source);
+    expect(note.wikilinks.map((w) => w.target)).toEqual(["Real"]);
+  });
+
+  it("excludes invalid-frontmatter wikilinks when fences are interleaved", () => {
+    const source = [
+      "---",
+      "title: [unclosed",
+      "[[FakeInInvalid]]",
+      "---",
+      "# Nota",
+      "",
+      "```",
+      "[[FakeInFence]]",
+      "```",
+      "",
+      "[[Real]]",
+      "",
+    ].join("\n");
+    const note = parse(source);
+    expect(note.frontmatter.kind).toBe("invalid");
+    expect(note.wikilinks.map((w) => w.target)).toEqual(["Real"]);
+  });
+
+  it("excludes indented wikilinks before and after fences", () => {
+    const source = [
+      "    [[IndentedBefore]]",
+      "",
+      "```",
+      "[[InFence]]",
+      "```",
+      "",
+      "    [[IndentedAfter]]",
+      "",
+      "[[Real]]",
+      "",
+    ].join("\n");
+    const note = parse(source);
+    expect(note.wikilinks.map((w) => w.target)).toEqual(["Real"]);
+  });
+
+  it("excludes multiple interleaved fence and indented regions", () => {
+    const source = [
+      "    [[IndentedOne]]",
+      "",
+      "```",
+      "[[FenceOne]]",
+      "```",
+      "",
+      "    [[IndentedTwo]]",
+      "",
+      "~~~",
+      "[[FenceTwo]]",
+      "~~~",
+      "",
+      "[[Real]]",
+      "",
+    ].join("\n");
+    const note = parse(source);
+    expect(note.wikilinks.map((w) => w.target)).toEqual(["Real"]);
+  });
+});
+
+describe("exact single trailing body break", () => {
+  it("collapses multiple trailing CRLF breaks into one on an LF note", () => {
+    const source = blockSource("- hecho");
+    const result = replaceManagedBlock(
+      source,
+      "sess-01ab",
+      "daily",
+      "- a\r\n- b\r\n\r\n\r\n",
+    );
+    expect(result.kind).toBe("replaced");
+    if (result.kind === "replaced") {
+      expect(
+        result.source.slice(result.block.body_start, result.block.body_end),
+      ).toBe("- a\n- b\n");
+    }
+  });
+
+  it("collapses multiple trailing mixed breaks on a CRLF note", () => {
+    const source = [
+      "# 2026-08-11",
+      "",
+      "## Tareas",
+      "",
+      "<!-- resyst-vault:begin session=sess-01ab target=daily -->",
+      "- hecho",
+      "<!-- resyst-vault:end session=sess-01ab target=daily -->",
+      "",
+      "## Reflexión",
+      "",
+    ].join("\r\n");
+    const result = replaceManagedBlock(
+      source,
+      "sess-01ab",
+      "daily",
+      "- a\n- b\n\n\r\n\n",
+    );
+    expect(result.kind).toBe("replaced");
+    if (result.kind === "replaced") {
+      expect(
+        result.source.slice(result.block.body_start, result.block.body_end),
+      ).toBe("- a\r\n- b\r\n");
+    }
+  });
+
+  it("collapses multiple trailing breaks on a CR-only note", () => {
+    const source = [
+      "# 2026-08-11",
+      "",
+      "## Tareas",
+      "",
+      "<!-- resyst-vault:begin session=sess-01ab target=daily -->",
+      "- hecho",
+      "<!-- resyst-vault:end session=sess-01ab target=daily -->",
+      "",
+    ].join("\r");
+    const result = replaceManagedBlock(source, "sess-01ab", "daily", "- a\n- b\r\r\r");
+    expect(result.kind).toBe("replaced");
+    if (result.kind === "replaced") {
+      expect(
+        result.source.slice(result.block.body_start, result.block.body_end),
+      ).toBe("- a\r- b\r");
+    }
+  });
+
+  it("keeps intentional internal blank lines while collapsing trailing breaks", () => {
+    const source = blockSource("- hecho");
+    const result = replaceManagedBlock(
+      source,
+      "sess-01ab",
+      "daily",
+      "- a\n\n- b\n\n\n\n",
+    );
+    expect(result.kind).toBe("replaced");
+    if (result.kind === "replaced") {
+      expect(
+        result.source.slice(result.block.body_start, result.block.body_end),
+      ).toBe("- a\n\n- b\n");
+    }
+  });
+
+  it("inserts with exactly one trailing break after collapsing", () => {
+    const source = "# Nota\n\n## Tareas\n";
+    const result = insertManagedBlock(
+      source,
+      "## Tareas",
+      "sess-01ab",
+      "daily",
+      "- a\n- b\r\n\r\n",
+    );
+    expect(result.kind).toBe("inserted");
+    if (result.kind === "inserted") {
+      expect(
+        result.source.slice(result.block.body_start, result.block.body_end),
+      ).toBe("- a\n- b\n");
+    }
+  });
+});
+
+
+describe("inline code spans on later lines", () => {
+  it("excludes inline-code wikilinks on later lines (LF)", () => {
+    const source = "[[Antes]]\n\n`[[Dos]]`\n\n``[[Tres]]``\n\n[[Despues]]\n";
+    const note = parse(source);
+    expect(note.wikilinks.map((w) => w.target)).toEqual(["Antes", "Despues"]);
+  });
+
+  it("excludes inline-code wikilinks on later lines (CRLF)", () => {
+    const source = "[[Antes]]\r\n\r\n`[[Dos]]`\r\n\r\n``[[Tres]]``\r\n\r\n[[Despues]]\r\n";
+    const note = parse(source);
+    expect(note.wikilinks.map((w) => w.target)).toEqual(["Antes", "Despues"]);
+  });
+
+  it("excludes inline-code wikilinks on later lines (CR)", () => {
+    const source = "[[Antes]]\r\r`[[Dos]]`\r\r``[[Tres]]``\r\r[[Despues]]\r";
+    const note = parse(source);
+    expect(note.wikilinks.map((w) => w.target)).toEqual(["Antes", "Despues"]);
+  });
+});
+
+describe("frontmatter scalar bounds", () => {
+  it("bounds scalar title and date values at the string limit", () => {
+    const atLimit = "t".repeat(1024);
+    const overLimit = "t".repeat(1025);
+    const sourceAt = `---\ntitle: ${atLimit}\ndate: ${"d".repeat(1024)}\n---\n# Nota\n`;
+    const noteAt = parse(sourceAt);
+    expect(noteAt.frontmatter.kind).toBe("present");
+    if (noteAt.frontmatter.kind === "present") {
+      expect(noteAt.frontmatter.metadata.title).toBe(atLimit);
+      expect(noteAt.frontmatter.metadata.date).toBe("d".repeat(1024));
+    }
+    const sourceOver = `---\ntitle: ${overLimit}\ndate: ${"d".repeat(1025)}\n---\n# Nota\n`;
+    const noteOver = parse(sourceOver);
+    expect(noteOver.frontmatter.kind).toBe("present");
+    if (noteOver.frontmatter.kind === "present") {
+      expect(noteOver.frontmatter.metadata.title).toBeNull();
+      expect(noteOver.frontmatter.metadata.date).toBeNull();
+    }
+  });
+
+  it("narrows empty and overlong scalar tags/aliases to empty arrays", () => {
+    const source = [
+      "---",
+      'title: ""',
+      "tags: ''",
+      "aliases: " + "a".repeat(1025),
+      "---",
+      "# Nota",
+      "",
+    ].join("\n");
+    const note = parse(source);
+    expect(note.frontmatter.kind).toBe("present");
+    if (note.frontmatter.kind === "present") {
+      expect(note.frontmatter.metadata.title).toBeNull();
+      expect(note.frontmatter.metadata.tags).toEqual([]);
+      expect(note.frontmatter.metadata.aliases).toEqual([]);
+    }
+  });
+});
