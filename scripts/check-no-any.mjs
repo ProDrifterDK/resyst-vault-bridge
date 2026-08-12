@@ -1,27 +1,23 @@
 #!/usr/bin/env node
 /**
- * Gate that fails on explicit `any` in TypeScript source and test files.
+ * Repository-wide no-explicit-`any` gate.
  *
- * Scans git-tracked `.ts`/`.tsx` files (plus untracked, non-ignored ones so
- * the gate works before staging) for the standalone token `any` and fails on
- * the first match.
+ * Runs Biome's AST-based `noExplicitAny` rule over every tracked TypeScript
+ * source and test file (plus untracked, non-ignored files so the gate works
+ * before staging). AST-based detection cannot be fooled by comments or
+ * string literals, and passing the explicit file list keeps coverage
+ * repository-wide regardless of Biome configuration includes.
  *
- * Exclusions live in the exact, reviewed allowlist file
- * `scripts/no-any-allowlist.txt` (initially empty). Each line names one
- * exact occurrence as `path:line` (1-based, relative to the repository
- * root). Adding an exclusion requires explicit review: the file documents
- * why the occurrence is a reviewed exception rather than an escape hatch.
+ * Usage:
+ *   node scripts/check-no-any.mjs            # scan tracked + untracked .ts/.tsx
+ *   node scripts/check-no-any.mjs <path>...  # scan exactly the given paths
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const ALLOWLIST_PATH = path.join(ROOT, "scripts", "no-any-allowlist.txt");
-
-/** Match the standalone token `any`, including in type positions. */
-const EXPLICIT_ANY = /\bany\b/;
+const BIOME = path.join(ROOT, "node_modules", ".bin", "biome");
 
 function trackedFiles() {
   const files = new Set();
@@ -38,36 +34,22 @@ function trackedFiles() {
   return [...files].sort();
 }
 
-function loadAllowlist() {
-  const entries = new Set();
-  if (!existsSync(ALLOWLIST_PATH)) return entries;
-  for (const line of readFileSync(ALLOWLIST_PATH, "utf8").split(/\r?\n/)) {
-    const entry = line.trim();
-    if (entry.length === 0 || entry.startsWith("#")) continue;
-    entries.add(entry);
-  }
-  return entries;
+const explicit = process.argv.slice(2);
+const targets = explicit.length > 0 ? explicit : trackedFiles();
+
+if (targets.length === 0) {
+  console.log("check:no-any passed: no TypeScript files to scan");
+  process.exit(0);
 }
 
-let violations = 0;
-const allowlist = loadAllowlist();
-for (const file of trackedFiles()) {
-  const content = readFileSync(path.join(ROOT, file), "utf8");
-  const lines = content.split(/\r?\n/);
-  for (let index = 0; index < lines.length; index += 1) {
-    if (!EXPLICIT_ANY.test(lines[index] ?? "")) continue;
-    const location = `${file}:${index + 1}`;
-    if (allowlist.has(location)) continue;
-    violations += 1;
-    console.error(`explicit \`any\` at ${location}`);
-  }
-}
-
-if (violations > 0) {
+try {
+  execFileSync(BIOME, ["lint", ...targets], { cwd: ROOT, stdio: "inherit" });
+} catch {
   console.error(
-    `check:no-any failed with ${violations} occurrence(s); ` +
-      "fix the code or add a reviewed entry to scripts/no-any-allowlist.txt",
+    "check:no-any failed: explicit `any` found by Biome (see diagnostics above)",
   );
   process.exit(1);
 }
-console.log("check:no-any passed: no explicit `any` in tracked source or tests");
+console.log(
+  "check:no-any passed: Biome found no explicit `any` in tracked source or tests",
+);
