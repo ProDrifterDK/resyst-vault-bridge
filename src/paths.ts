@@ -82,13 +82,16 @@ export class VaultPathError extends Error {
   }
 }
 
-/** Minimal filesystem seam so tests never touch the real vault. */
+/**
+ * Minimal filesystem seam so tests never touch the real vault. `stat`/`lstat`
+ * must expose the filesystem identity (`dev`/`ino`) so the vault root can be
+ * pinned and re-verified on every resolve (Node `Stats` provides both on
+ * POSIX with Node >= 22).
+ */
 export interface VaultPathsFs {
   realpath(filePath: string): Promise<string>;
-  stat(filePath: string): Promise<{ isDirectory(): boolean; isFile(): boolean }>;
-  lstat(
-    filePath: string,
-  ): Promise<{ isDirectory(): boolean; isFile(): boolean; isSymbolicLink(): boolean }>;
+  stat(filePath: string): Promise<StatLike>;
+  lstat(filePath: string): Promise<LStatLike>;
 }
 
 /** Node `fs/promises` adapter for {@link VaultPathsFs}. */
@@ -165,15 +168,26 @@ function lexicalSegments(
 
 /**
  * The containment boundary shared by every read and write path. Construct
- * with the configured vault root (already validated by the config layer);
- * the root is symlink-resolved on first use and every resolved note must stay
- * inside that real root.
+ * with the configured vault root (already validated by the config layer).
+ * The root's real path plus dev/ino identity is pinned on first use and
+ * re-established on every resolve; a retargeted symlink, renamed-away root,
+ * or same-pathname replacement is rejected as `symlink_escape` (or
+ * `io_error` when the current identity cannot be established). Every
+ * resolved note must stay inside the pinned real root.
  */
+/** Pinned vault root identity: the initially resolved real path plus dev/ino. */
+interface RootIdentity {
+  real: string;
+  dev: number;
+  ino: number;
+}
+
 export class VaultPaths {
   readonly vaultRoot: string;
   readonly attachmentsDir: string;
   private readonly fs: VaultPathsFs;
-  private vaultReal: string | undefined;
+  /** Initially pinned root identity; re-verified on every resolve. */
+  private pinnedIdentity: RootIdentity | undefined;
 
   constructor(
     vaultRoot: string,
@@ -184,17 +198,52 @@ export class VaultPaths {
     this.fs = options.fs ?? nodeVaultPathsFs;
   }
 
-  private async ensureVaultReal(): Promise<string> {
-    if (this.vaultReal === undefined) {
-      try {
-        this.vaultReal = await this.fs.realpath(this.vaultRoot);
-      } catch {
-        // The containment root cannot be established; every failure (including
-        // a vanished root) is a fixed redacted io error, never a raw Node error.
-        throw new VaultPathError("io_error");
-      }
+  /**
+   * Establish the CURRENT root identity: realpath plus dev/ino of the
+   * configured root. Failures to establish identity (vanished root, EACCES,
+   * EIO) surface as the fixed redacted `io_error`; a root that is no longer a
+   * directory cannot establish the vault identity.
+   */
+  private async currentRootIdentity(): Promise<RootIdentity> {
+    let real: string;
+    try {
+      real = await this.fs.realpath(this.vaultRoot);
+    } catch {
+      throw new VaultPathError("io_error");
     }
-    return this.vaultReal;
+    let rootStat: StatLike;
+    try {
+      rootStat = await this.fs.stat(this.vaultRoot);
+    } catch {
+      throw new VaultPathError("io_error");
+    }
+    if (!rootStat.isDirectory()) {
+      throw new VaultPathError("symlink_escape");
+    }
+    return { real, dev: rootStat.dev, ino: rootStat.ino };
+  }
+
+  /**
+   * Re-establish the current root identity on every resolve and compare it to
+   * the initially pinned identity. A retargeted symlink, renamed-away root,
+   * or same-pathname replacement changes the realpath or the dev/ino and is
+   * rejected with `symlink_escape`; the replacement is never blessed as the
+   * new trusted root.
+   */
+  private async verifiedVaultReal(): Promise<string> {
+    if (this.pinnedIdentity === undefined) {
+      this.pinnedIdentity = await this.currentRootIdentity();
+      return this.pinnedIdentity.real;
+    }
+    const current = await this.currentRootIdentity();
+    if (
+      current.real !== this.pinnedIdentity.real ||
+      current.dev !== this.pinnedIdentity.dev ||
+      current.ino !== this.pinnedIdentity.ino
+    ) {
+      throw new VaultPathError("symlink_escape");
+    }
+    return this.pinnedIdentity.real;
   }
 
   private isWithin(realPath: string, vaultReal: string): boolean {
@@ -208,7 +257,7 @@ export class VaultPaths {
       options.automatic ?? false,
       this.attachmentsDir,
     );
-    const vaultReal = await this.ensureVaultReal();
+    const vaultReal = await this.verifiedVaultReal();
     const absolute = path.join(this.vaultRoot, ...segments);
 
     const parentAbs = path.dirname(absolute);
@@ -236,20 +285,23 @@ export class VaultPaths {
   /** Resolve a note for writing; the parent must exist, the target must not be a symlink. */
   async resolveWrite(input: string): Promise<ResolvedVaultPath> {
     const segments = lexicalSegments(input, false, this.attachmentsDir);
-    const vaultReal = await this.ensureVaultReal();
+    const vaultReal = await this.verifiedVaultReal();
     const absolute = path.join(this.vaultRoot, ...segments);
 
-    if (segments.length > 1) {
-      const parentSegments = segments.slice(0, -1);
-      const parentAbs = path.join(this.vaultRoot, ...parentSegments);
-      const parentReal = await this.realpathOrThrow(parentAbs, "parent_missing");
-      if (!this.isWithin(parentReal, vaultReal)) {
-        throw new VaultPathError("symlink_escape");
-      }
-      const parentStat = await this.statOrThrow(parentAbs, "parent_missing");
-      if (!parentStat.isDirectory()) {
-        throw new VaultPathError("parent_not_directory");
-      }
+    // Every write validates its current parent — including root-level writes,
+    // whose parent is the (re-verified) vault root itself.
+    const parentSegments = segments.slice(0, -1);
+    const parentAbs =
+      parentSegments.length === 0
+        ? this.vaultRoot
+        : path.join(this.vaultRoot, ...parentSegments);
+    const parentReal = await this.realpathOrThrow(parentAbs, "parent_missing");
+    if (!this.isWithin(parentReal, vaultReal)) {
+      throw new VaultPathError("symlink_escape");
+    }
+    const parentStat = await this.statOrThrow(parentAbs, "parent_missing");
+    if (!parentStat.isDirectory()) {
+      throw new VaultPathError("parent_not_directory");
     }
 
     let linkStat: LStatLike | null;
@@ -336,10 +388,12 @@ export class VaultPaths {
   }
 }
 
-/** Minimal directory/file shape shared by stat results. */
+/** Directory/file shape plus filesystem identity shared by stat results. */
 interface StatLike {
   isDirectory(): boolean;
   isFile(): boolean;
+  dev: number;
+  ino: number;
 }
 
 /** lstat result shape that additionally distinguishes symlinks. */

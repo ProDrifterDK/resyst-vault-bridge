@@ -9,7 +9,7 @@
  */
 import { describe, expect, expectTypeOf, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -112,6 +112,8 @@ function nonRegularTargetFs(
             isFile: () => false,
             isDirectory: () => false,
             isSymbolicLink: () => false,
+            dev: 0,
+            ino: 0,
           };
         }
         return nodeVaultPathsFs.lstat(filePath);
@@ -576,6 +578,114 @@ describe("VaultPaths: non-regular write targets", () => {
     await withPaths(async (ctx) => {
       const resolved = await ctx.paths.resolveWrite("CLAUDE.md");
       expect(resolved.absolute).toBe(ctx.vault.paths.claudeMd);
+    });
+  });
+});
+
+describe("VaultPaths: pinned vault root identity", () => {
+  it("rejects a root-level new write after the vault root symlink is retargeted outside", async () => {
+    await withPaths(async (ctx) => {
+      const link = path.join(ctx.root, "vault-link");
+      await symlink(ctx.vault.vaultPath, link);
+      const paths = new VaultPaths(link, { fs: nodeVaultPathsFs });
+      // First call pins the initial identity through the link.
+      const first = await paths.resolveRead("CLAUDE.md");
+      expect(first.absolute).toBe(path.join(link, "CLAUDE.md"));
+      // Retarget the symlink to a directory outside the pinned vault.
+      await rm(link);
+      await symlink(ctx.outsideDir, link);
+      const err = await capture(() => paths.resolveWrite("note.md"));
+      expect(err).toBeDefined();
+      expect(err?.code).toBe("symlink_escape");
+      expect(err?.message).not.toContain(ctx.vault.vaultPath);
+      expect(err?.message).not.toContain("outside");
+      expect(JSON.stringify(err)).not.toContain(ctx.vault.vaultPath);
+    });
+  });
+
+  it("rejects reads after the vault root symlink is retargeted outside", async () => {
+    await withPaths(async (ctx) => {
+      const link = path.join(ctx.root, "vault-link");
+      await symlink(ctx.vault.vaultPath, link);
+      const paths = new VaultPaths(link, { fs: nodeVaultPathsFs });
+      await paths.resolveRead("CLAUDE.md");
+      await rm(link);
+      await symlink(ctx.outsideDir, link);
+      const err = await capture(() => paths.resolveRead("CLAUDE.md"));
+      expect(err).toBeDefined();
+      expect(err?.code).toBe("symlink_escape");
+    });
+  });
+
+  it("rejects a root-level write after the vault root is renamed away", async () => {
+    await withPaths(async (ctx) => {
+      const paths = new VaultPaths(ctx.vault.vaultPath, { fs: nodeVaultPathsFs });
+      await paths.resolveWrite("note.md");
+      const moved = path.join(ctx.root, "vault-moved");
+      await rename(ctx.vault.vaultPath, moved);
+      const err = await capture(() => paths.resolveWrite("note.md"));
+      expect(err).toBeDefined();
+      expect(err?.code).toBe("io_error");
+      const readErr = await capture(() => paths.resolveRead("CLAUDE.md"));
+      expect(readErr).toBeDefined();
+      expect(readErr?.code).toBe("io_error");
+    });
+  });
+
+  it("rejects a root-level write after the vault root is replaced by an outside symlink", async () => {
+    await withPaths(async (ctx) => {
+      const paths = new VaultPaths(ctx.vault.vaultPath, { fs: nodeVaultPathsFs });
+      await paths.resolveWrite("note.md");
+      await rm(ctx.vault.vaultPath, { recursive: true, force: true });
+      await symlink(ctx.outsideDir, ctx.vault.vaultPath);
+      const err = await capture(() => paths.resolveWrite("note.md"));
+      expect(err).toBeDefined();
+      expect(err?.code).toBe("symlink_escape");
+    });
+  });
+
+  it("rejects a root-level write after the vault root directory is replaced at the same pathname", async () => {
+    await withPaths(async (ctx) => {
+      const paths = new VaultPaths(ctx.vault.vaultPath, { fs: nodeVaultPathsFs });
+      await paths.resolveWrite("note.md");
+      // Renaming the vault away and recreating a brand-new directory at the
+      // same pathname keeps the same realpath string. The old inode stays
+      // live at the moved path, so the replacement must have a different
+      // dev/ino identity; only identity pinning can detect this.
+      const moved = path.join(ctx.root, "vault-moved");
+      await rename(ctx.vault.vaultPath, moved);
+      await mkdir(ctx.vault.vaultPath);
+      const err = await capture(() => paths.resolveWrite("note.md"));
+      expect(err).toBeDefined();
+      expect(err?.code).toBe("symlink_escape");
+      const readErr = await capture(() => paths.resolveRead("CLAUDE.md"));
+      expect(readErr).toBeDefined();
+      expect(readErr?.code).toBe("symlink_escape");
+    });
+  });
+
+  it("still accepts root-level new writes while the root is unchanged", async () => {
+    await withPaths(async (ctx) => {
+      const first = await ctx.paths.resolveWrite("BrandNew.md");
+      expect(first.absolute).toBe(ctx.vault.absolute("BrandNew.md"));
+      const second = await ctx.paths.resolveWrite("BrandNew2.md");
+      expect(second.absolute).toBe(ctx.vault.absolute("BrandNew2.md"));
+      const read = await ctx.paths.resolveRead("CLAUDE.md");
+      expect(read.vaultRelative).toBe("CLAUDE.md");
+    });
+  });
+
+  it("keeps rejecting nested writes after the root is retargeted outside", async () => {
+    await withPaths(async (ctx) => {
+      const link = path.join(ctx.root, "vault-link");
+      await symlink(ctx.vault.vaultPath, link);
+      const paths = new VaultPaths(link, { fs: nodeVaultPathsFs });
+      await paths.resolveRead("CLAUDE.md");
+      await rm(link);
+      await symlink(ctx.outsideDir, link);
+      const err = await capture(() => paths.resolveWrite("Proyectos/New.md"));
+      expect(err).toBeDefined();
+      expect(err?.code).toBe("symlink_escape");
     });
   });
 });
