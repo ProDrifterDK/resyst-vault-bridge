@@ -30,6 +30,7 @@ import type {
 const MONTH_PATTERN = /^\d{4}-(?:0[1-9]|1[0-2])$/u;
 const MAX_RECORD_BYTES = 16 * 1024 * 1024;
 const MAX_MONTHS = 240;
+const MAX_RECORDS = 10_000;
 
 export interface JournalStoreOptions {
   /** Vault root containing `.resyst/journal` and `.resyst/receipts`. */
@@ -431,6 +432,52 @@ export class JournalStore {
     }
     matches.sort((left, right) => String(left.event_id).localeCompare(String(right.event_id)));
     return matches[0] ?? null;
+  }
+
+  /** Bounded, deterministic enumeration for recovery and status. */
+  async listEvents(): Promise<JournalEvent[]> {
+    await this.verifyRoot();
+    if (!(await this.readRootDirectory(this.journalRoot))) return [];
+    let monthNames: string[];
+    try { monthNames = await readdir(this.journalRoot); } catch { throw new JournalIntegrityError(); }
+    const months = boundedMonths(monthNames).valid;
+    const events: JournalEvent[] = [];
+    for (const month of months) {
+      const directory = await this.readMonthDirectory(this.journalRoot, month);
+      let directoryNames: string[];
+      try { directoryNames = await readdir(directory); } catch { throw new JournalIntegrityError(); }
+      const names = directoryNames.filter((name) => name.endsWith(".json")).sort();
+      if (events.length + names.length > MAX_RECORDS) throw new JournalIntegrityError();
+      for (const name of names) {
+        const raw = await readRawRecord(path.join(directory, name));
+        if (raw === null) throw new JournalIntegrityError();
+        events.push(parsedEvent(raw));
+      }
+    }
+    return events.sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)) || String(left.event_id).localeCompare(String(right.event_id)));
+  }
+
+  /** Bounded, deterministic receipt enumeration without note content. */
+  async listReceipts(): Promise<Receipt[]> {
+    await this.verifyRoot();
+    if (!(await this.readRootDirectory(this.receiptsRoot))) return [];
+    let monthNames: string[];
+    try { monthNames = await readdir(this.receiptsRoot); } catch { throw new JournalIntegrityError(); }
+    const months = boundedMonths(monthNames).valid;
+    const receipts: Receipt[] = [];
+    for (const month of months) {
+      const directory = await this.readMonthDirectory(this.receiptsRoot, month);
+      let directoryNames: string[];
+      try { directoryNames = await readdir(directory); } catch { throw new JournalIntegrityError(); }
+      const names = directoryNames.filter((name) => name.endsWith(".json")).sort();
+      if (receipts.length + names.length > MAX_RECORDS) throw new JournalIntegrityError();
+      for (const name of names) {
+        const raw = await readRawRecord(path.join(directory, name));
+        if (raw === null) throw new JournalIntegrityError();
+        receipts.push(parsedReceipt(raw));
+      }
+    }
+    return receipts.sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)) || String(left.event_id).localeCompare(String(right.event_id)));
   }
 
   /** Exposes only validated, vault-relative journal roots for diagnostics. */

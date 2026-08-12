@@ -49,6 +49,17 @@ export interface LockHandle {
   release(): Promise<void>;
 }
 
+export type LockInspection =
+  | { kind: "free" }
+  | { kind: "held"; liveness: "live" | "dead" | "unknown" };
+
+export type AbandonedLockCleanup =
+  | "removed"
+  | "not_abandoned"
+  | "refused_unknown_liveness"
+  | "refused_corrupt"
+  | "refused_race";
+
 export class LockTimeoutError extends Error {
   constructor() {
     super("local write lock unavailable before timeout");
@@ -412,6 +423,28 @@ export class LocalLock {
         if (failure !== undefined) throw new LockIntegrityError();
       },
     };
+  }
+
+  /** Inspect without creating or deleting a lock record. */
+  async inspect(): Promise<LockInspection> {
+    const owner = await this.readOwner();
+    if (owner === null) return { kind: "free" };
+    const live = await this.ownerLive(owner);
+    return { kind: "held", liveness: live === true ? "live" : live === false ? "dead" : "unknown" };
+  }
+
+  /** Remove only an owner freshly re-proven dead; never age or unknown. */
+  async removeAbandoned(): Promise<AbandonedLockCleanup> {
+    let owner: LockOwner | null;
+    try { owner = await this.readOwner(); } catch { return "refused_corrupt"; }
+    if (owner === null) return "not_abandoned";
+    const live = await this.ownerLive(owner);
+    if (live === true) return "not_abandoned";
+    if (live === "unknown") return "refused_unknown_liveness";
+    try {
+      await this.tryRemoveAbandoned(owner);
+      return (await this.readOwner()) === null ? "removed" : "refused_race";
+    } catch { return "refused_race"; }
   }
 
   async acquire(): Promise<LockHandle> {

@@ -35,6 +35,7 @@ import type {
   FailReason,
   HashHex,
   IdempotencyKey,
+  JournalEvent,
   Receipt,
   VaultPath,
 } from "./types.js";
@@ -52,9 +53,14 @@ export interface TransactionInput {
   checkpoint: ApplyCheckpoint;
   idempotency_key: IdempotencyKey;
   event_id: EventId;
-  plans: [WritePlan];
-  /** Test-only failure injection at the final pre-rename boundary or crash seam. */
-  hooks?: { beforeRename?: () => Promise<void>; afterRename?: () => Promise<void> };
+  plans: WritePlan[];
+  /** Test-only failure injection at each final pre/post-rename boundary. */
+  hooks?: {
+    beforeRename?: (plan: WritePlan, index: number) => Promise<void>;
+    /** Fires after durable rename but BEFORE the progress record is updated. */
+    afterRenamePreProgress?: (plan: WritePlan, index: number) => Promise<void>;
+    afterRename?: (plan: WritePlan, index: number) => Promise<void>;
+  };
 }
 
 export interface TransactionServiceOptions {
@@ -70,8 +76,9 @@ export interface TransactionServiceOptions {
   /** Validated vault-relative Inbox directory when config is not supplied. */
   inboxDir?: string;
   now?: () => string;
-  beforeRename?: () => Promise<void>;
-  afterRename?: () => Promise<void>;
+  beforeRename?: (plan: WritePlan, index: number) => Promise<void>;
+  afterRenamePreProgress?: (plan: WritePlan, index: number) => Promise<void>;
+  afterRename?: (plan: WritePlan, index: number) => Promise<void>;
 }
 
 export class TransactionScopeError extends Error {
@@ -103,6 +110,15 @@ class ProgressIntegrityError extends TransactionIntegrityError {
   }
 }
 
+export class MissingProgressError extends Error {
+  readonly event_id: EventId;
+  constructor(eventId: EventId) {
+    super("transaction progress is not yet durable; details redacted");
+    this.name = "MissingProgressError";
+    this.event_id = eventId;
+  }
+}
+
 interface TargetSnapshot {
   exists: boolean;
   content: string;
@@ -123,11 +139,12 @@ interface BackupRecord {
 }
 
 interface ProgressRecord {
-  version: 1;
+  version: 2;
   event_id: EventId;
   path: VaultPath;
   before_hash: HashHex | null;
   after_hash: HashHex;
+  temp_name: string;
   state: "prepared" | "renamed";
 }
 
@@ -201,8 +218,9 @@ function narrowInput(value: unknown): TransactionInput {
   let checkpoint: ReturnType<typeof parseCheckpoint>;
   try { checkpoint = parseCheckpoint(record.checkpoint); } catch { throw new TransactionIntegrityError(); }
   if (checkpoint.kind !== "apply") throw new TransactionIntegrityError();
-  if (!Array.isArray(record.plans) || record.plans.length !== 1) throw new TransactionScopeError();
-  const plan = safePlan(record.plans[0]);
+  if (!Array.isArray(record.plans) || record.plans.length < 1 || record.plans.length > 32) throw new TransactionScopeError();
+  const plans = record.plans.map(safePlan).sort((left, right) => String(left.path).localeCompare(String(right.path)));
+  if (new Set(plans.map((plan) => plan.path)).size !== plans.length) throw new TransactionScopeError();
   const event_id = safeEventId(record.event_id);
   const idempotency_key = safeKey(record.idempotency_key);
   const hooksValue = record.hooks;
@@ -211,19 +229,22 @@ function narrowInput(value: unknown): TransactionInput {
     if (typeof hooksValue !== "object" || hooksValue === null || Array.isArray(hooksValue)) throw new TransactionIntegrityError();
     const hooksRecord = hooksValue as Record<string, unknown>;
     const beforeRename = hooksRecord.beforeRename;
+    const afterRenamePreProgress = hooksRecord.afterRenamePreProgress;
     const afterRename = hooksRecord.afterRename;
-    if (
-      (beforeRename !== undefined && typeof beforeRename !== "function") ||
-      (afterRename !== undefined && typeof afterRename !== "function")
-    ) throw new TransactionIntegrityError();
-    if (beforeRename !== undefined || afterRename !== undefined) {
+    if ((beforeRename !== undefined && typeof beforeRename !== "function")
+        || (afterRenamePreProgress !== undefined && typeof afterRenamePreProgress !== "function")
+        || (afterRename !== undefined && typeof afterRename !== "function")) {
+      throw new TransactionIntegrityError();
+    }
+    if (beforeRename !== undefined || afterRenamePreProgress !== undefined || afterRename !== undefined) {
       hooks = {
-        ...(beforeRename === undefined ? {} : { beforeRename: beforeRename as () => Promise<void> }),
-        ...(afterRename === undefined ? {} : { afterRename: afterRename as () => Promise<void> }),
+        ...(beforeRename === undefined ? {} : { beforeRename: beforeRename as (plan: WritePlan, index: number) => Promise<void> }),
+        ...(afterRenamePreProgress === undefined ? {} : { afterRenamePreProgress: afterRenamePreProgress as (plan: WritePlan, index: number) => Promise<void> }),
+        ...(afterRename === undefined ? {} : { afterRename: afterRename as (plan: WritePlan, index: number) => Promise<void> }),
       };
     }
   }
-  const result: TransactionInput = { checkpoint, idempotency_key, event_id, plans: [plan] };
+  const result: TransactionInput = { checkpoint, idempotency_key, event_id, plans };
   if (hooks !== undefined) result.hooks = hooks;
   return result;
 }
@@ -353,9 +374,19 @@ async function backupSnapshot(
   return metadata;
 }
 
+function recordKey(relative: VaultPath): string {
+  const encoded = Buffer.from(relative, "utf8").toString("base64url");
+  if (!safeRecordName(encoded)) throw new TransactionIntegrityError();
+  return encoded;
+}
+
+function progressPath(directory: string, relative: VaultPath): string {
+  return path.join(directory, `progress-${recordKey(relative)}.json`);
+}
+
 async function writeProgress(stateRoot: string, directory: string, record: ProgressRecord): Promise<void> {
   await ensurePrivateDirectory(stateRoot, directory);
-  const destination = path.join(directory, "progress.json");
+  const destination = progressPath(directory, record.path);
   const temporary = path.join(directory, `.progress.tmp-${process.pid}-${randomBytes(8).toString("hex")}`);
   const contents = JSON.stringify(record);
   if (Buffer.byteLength(contents, "utf8") > MAX_PROGRESS_BYTES) throw new TransactionIntegrityError();
@@ -381,85 +412,52 @@ async function writeProgress(stateRoot: string, directory: string, record: Progr
 function parseProgressRecord(value: unknown, eventId: EventId, target: VaultPath): ProgressRecord {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TransactionIntegrityError();
   const record = value as Record<string, unknown>;
-  const keys = ["version", "event_id", "path", "before_hash", "after_hash", "state"];
-  if (Object.keys(record).some((key) => !keys.includes(key)) || keys.some((key) => !(key in record))) {
-    throw new TransactionIntegrityError();
-  }
-  if (record.version !== 1 || record.event_id !== eventId || record.path !== target) {
-    throw new TransactionIntegrityError();
-  }
+  const keys = ["version", "event_id", "path", "before_hash", "after_hash", "temp_name", "state"];
+  if (Object.keys(record).some((key) => !keys.includes(key)) || keys.some((key) => !(key in record))) throw new TransactionIntegrityError();
+  if (record.version !== 2 || record.event_id !== eventId || record.path !== target) throw new TransactionIntegrityError();
   let beforeHash: HashHex | null;
   let afterHash: HashHex;
   try {
-    beforeHash = record.before_hash === null
-      ? null
-      : parseWithSchema(HashHexSchema, record.before_hash, "progress before hash");
+    beforeHash = record.before_hash === null ? null : parseWithSchema(HashHexSchema, record.before_hash, "progress before hash");
     afterHash = parseWithSchema(HashHexSchema, record.after_hash, "progress after hash");
-  } catch {
-    throw new TransactionIntegrityError();
-  }
+  } catch { throw new TransactionIntegrityError(); }
+  if (typeof record.temp_name !== "string" || !/^\.[A-Za-z0-9._-]{1,255}\.resyst-[A-Za-z0-9-]+$/u.test(record.temp_name)) throw new TransactionIntegrityError();
   if (record.state !== "prepared" && record.state !== "renamed") throw new TransactionIntegrityError();
   const parsedEvent = safeEventId(record.event_id);
   const parsedPath = safeRelativePath(record.path);
   if (parsedEvent !== eventId || parsedPath !== target) throw new TransactionIntegrityError();
-  return {
-    version: 1,
-    event_id: parsedEvent,
-    path: parsedPath,
-    before_hash: beforeHash,
-    after_hash: afterHash,
-    state: record.state,
-  };
+  return { version: 2, event_id: parsedEvent, path: parsedPath, before_hash: beforeHash, after_hash: afterHash, temp_name: record.temp_name, state: record.state };
 }
 
 async function existingPrivateDirectory(root: string, directory: string): Promise<boolean> {
   const rootAbsolute = path.resolve(root);
   const directoryAbsolute = path.resolve(directory);
-  if (directoryAbsolute !== rootAbsolute && !directoryAbsolute.startsWith(`${rootAbsolute}${path.sep}`)) {
-    throw new TransactionIntegrityError();
-  }
+  if (directoryAbsolute !== rootAbsolute && !directoryAbsolute.startsWith(`${rootAbsolute}${path.sep}`)) throw new TransactionIntegrityError();
   const relative = path.relative(rootAbsolute, directoryAbsolute);
   const segments = relative.split(path.sep).filter((item) => item.length > 0);
   let current = rootAbsolute;
-  for (const candidate of [current, ...segments.map((segment) => {
-    current = path.join(current, segment);
-    return current;
-  })]) {
+  for (const candidate of [current, ...segments.map((segment) => { current = path.join(current, segment); return current; })]) {
     let directoryStat;
     try { directoryStat = await lstat(candidate, { bigint: true }); }
-    catch (error) {
-      if (isMissing(error)) return false;
-      throw new TransactionIntegrityError();
-    }
+    catch (error) { if (isMissing(error)) return false; throw new TransactionIntegrityError(); }
     if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) throw new TransactionIntegrityError();
   }
   return true;
 }
 
-async function readProgress(
-  stateRoot: string,
-  directory: string,
-  eventId: EventId,
-  target: VaultPath,
-): Promise<ProgressRecord | null> {
+async function readProgress(stateRoot: string, directory: string, eventId: EventId, target: VaultPath): Promise<ProgressRecord | null> {
   if (!(await existingPrivateDirectory(stateRoot, directory))) return null;
-  const progressPath = path.join(directory, "progress.json");
+  const destination = progressPath(directory, target);
   let progressStat;
-  try { progressStat = await lstat(progressPath, { bigint: true }); }
-  catch (error) {
-    if (isMissing(error)) return null;
-    throw new ProgressIntegrityError();
-  }
-  if (!progressStat.isFile() || progressStat.isSymbolicLink()) throw new ProgressIntegrityError();
+  try { progressStat = await lstat(destination, { bigint: true }); }
+  catch (error) { if (isMissing(error)) return null; throw new TransactionIntegrityError(); }
+  if (!progressStat.isFile() || progressStat.isSymbolicLink()) throw new TransactionIntegrityError();
   let raw: string;
-  try { raw = await readFile(progressPath, "utf8"); }
-  catch { throw new ProgressIntegrityError(); }
-  if (Buffer.byteLength(raw, "utf8") > MAX_PROGRESS_BYTES) throw new ProgressIntegrityError();
+  try { raw = await readFile(destination, "utf8"); } catch { throw new TransactionIntegrityError(); }
+  if (Buffer.byteLength(raw, "utf8") > MAX_PROGRESS_BYTES) throw new TransactionIntegrityError();
   let parsed: unknown;
-  try { parsed = JSON.parse(raw) as unknown; }
-  catch { throw new ProgressIntegrityError(); }
-  try { return parseProgressRecord(parsed, eventId, target); }
-  catch { throw new ProgressIntegrityError(); }
+  try { parsed = JSON.parse(raw) as unknown; } catch { throw new TransactionIntegrityError(); }
+  return parseProgressRecord(parsed, eventId, target);
 }
 
 async function hasConflictCopy(parent: string, basename: string): Promise<boolean> {
@@ -511,8 +509,9 @@ export class TransactionService {
   private readonly pathsPromise: Promise<VaultPaths>;
   private readonly inboxDir: string;
   private readonly now: () => string;
-  private readonly beforeRename?: () => Promise<void>;
-  private readonly afterRename?: () => Promise<void>;
+  private readonly beforeRename?: (plan: WritePlan, index: number) => Promise<void>;
+  private readonly afterRenamePreProgress?: (plan: WritePlan, index: number) => Promise<void>;
+  private readonly afterRename?: (plan: WritePlan, index: number) => Promise<void>;
 
   constructor(options: TransactionServiceOptions) {
     this.vaultRoot = path.resolve(options.vaultRoot);
@@ -526,6 +525,7 @@ export class TransactionService {
     this.lock = options.lock ?? new LocalLock({ stateRoot: this.stateRoot });
     this.now = options.now ?? (() => new Date().toISOString());
     if (options.beforeRename !== undefined) this.beforeRename = options.beforeRename;
+    if (options.afterRenamePreProgress !== undefined) this.afterRenamePreProgress = options.afterRenamePreProgress;
     if (options.afterRename !== undefined) this.afterRename = options.afterRename;
     const trustedPaths = options.paths ?? (
       options.config !== undefined
@@ -558,22 +558,10 @@ export class TransactionService {
     return proposalPath;
   }
 
-  private async writeAtomic(
-    absolute: string,
-    content: string,
-    mode: number,
-    expected: TargetSnapshot | undefined,
-    hook: (() => Promise<void>) | undefined,
-  ): Promise<void> {
+  private async prepareAtomic(absolute: string, content: string, mode: number, expected: TargetSnapshot): Promise<string> {
     const parent = path.dirname(absolute);
-    let current: TargetSnapshot;
-    try { current = await readSnapshot(absolute); }
-    catch { throw new TransactionIntegrityError(); }
-    if (expected !== undefined) {
-      if (current.exists !== expected.exists || current.hash !== expected.hash || (current.exists && (current.dev !== expected.dev || current.ino !== expected.ino))) {
-        throw new TransactionIntegrityError();
-      }
-    }
+    const current = await readSnapshot(absolute);
+    if (current.exists !== expected.exists || current.hash !== expected.hash || (current.exists && (current.dev !== expected.dev || current.ino !== expected.ino))) throw new TransactionIntegrityError();
     const temporary = path.join(parent, `.${path.basename(absolute)}.resyst-${process.pid}-${randomBytes(8).toString("hex")}`);
     let handle: FileHandle | undefined;
     try {
@@ -582,133 +570,147 @@ export class TransactionService {
       await handle.chmod(mode & 0o7777);
       await handle.sync();
       await handle.close();
-      handle = undefined;
-      if (hook !== undefined) await hook();
-      // Revalidate immediately before rename to close the target swap window.
-      const finalCheck = await readSnapshot(absolute);
-      if (expected !== undefined && (finalCheck.exists !== expected.exists || finalCheck.hash !== expected.hash || (finalCheck.exists && (finalCheck.dev !== expected.dev || finalCheck.ino !== expected.ino)))) {
-        throw new TransactionIntegrityError();
-      }
-      await rename(temporary, absolute);
-      await directorySync(parent);
-    } catch (error) {
+      return temporary;
+    } catch {
       await handle?.close().catch(() => undefined);
       await unlink(temporary).catch(() => undefined);
-      if (error instanceof TransactionIntegrityError) throw error;
       throw new TransactionIntegrityError();
     }
   }
 
-  private async outcomeFailed(input: TransactionInput, reason: FailReason, target: WritePlan): Promise<CheckpointOutcome> {
-    const receipt: Receipt = await this.journal.writeReceipt({
-      version: 1, outcome: "failed", event_id: input.event_id, idempotency_key: input.idempotency_key,
-      reason, targets: [{ path: target.path, before_hash: target.before_hash, after_hash: target.after_hash }], created_at: nowIso(this.now),
-    });
+  private async publishAtomic(absolute: string, temporary: string, expected: TargetSnapshot, hook: (() => Promise<void>) | undefined): Promise<void> {
+    try {
+      if (path.dirname(temporary) !== path.dirname(absolute) || path.basename(temporary).includes(path.sep)) throw new TransactionIntegrityError();
+      if (hook !== undefined) await hook();
+      const finalCheck = await readSnapshot(absolute);
+      if (finalCheck.exists !== expected.exists || finalCheck.hash !== expected.hash || (finalCheck.exists && (finalCheck.dev !== expected.dev || finalCheck.ino !== expected.ino))) throw new TransactionIntegrityError();
+      const temporaryStat = await lstat(temporary, { bigint: true });
+      if (!temporaryStat.isFile() || temporaryStat.isSymbolicLink()) throw new TransactionIntegrityError();
+      await rename(temporary, absolute);
+      await directorySync(path.dirname(absolute));
+    } catch (error) {
+      if (error instanceof TransactionCrashError) throw error;
+      throw new TransactionIntegrityError();
+    }
+  }
+
+  private async writeAtomic(absolute: string, content: string, mode: number, expected: TargetSnapshot | undefined, hook: (() => Promise<void>) | undefined): Promise<void> {
+    const snapshot = expected ?? await readSnapshot(absolute);
+    const temporary = await this.prepareAtomic(absolute, content, mode, snapshot);
+    try { await this.publishAtomic(absolute, temporary, snapshot, hook); }
+    catch (error) { await unlink(temporary).catch(() => undefined); throw error; }
+  }
+
+  private targets(input: TransactionInput): Array<{ path: VaultPath; before_hash: HashHex | null; after_hash: HashHex }> {
+    return input.plans.map((target) => ({ path: target.path, before_hash: target.before_hash, after_hash: target.after_hash }));
+  }
+
+  private async outcomeFailed(input: TransactionInput, reason: FailReason): Promise<CheckpointOutcome> {
+    const receipt: Receipt = await this.journal.writeReceipt({ version: 1, outcome: "failed", event_id: input.event_id, idempotency_key: input.idempotency_key, reason, targets: this.targets(input), created_at: nowIso(this.now) });
     if (receipt.outcome !== "failed") throw new TransactionIntegrityError();
     return { kind: "failed", event_id: input.event_id, receipt };
   }
 
-  private outcomeFromReceipt(
-    existing: { event_id: EventId; receipt: Receipt },
-    idempotencyKey: IdempotencyKey,
-  ): CheckpointOutcome {
+  private outcomeFromReceipt(existing: { event_id: EventId; receipt: Receipt }, idempotencyKey: IdempotencyKey): CheckpointOutcome {
     switch (existing.receipt.outcome) {
-      case "applied":
-        return {
-          kind: "already_applied",
-          idempotency_key: idempotencyKey,
-          original_event_id: existing.event_id,
-          original_receipt: existing.receipt,
-        };
-      case "deferred_conflict":
-        return { kind: "deferred_conflict", event_id: existing.event_id, receipt: existing.receipt };
-      case "failed":
-        return { kind: "failed", event_id: existing.event_id, receipt: existing.receipt };
-      default:
-        // A receipt for a different transaction kind under this apply key is
-        // an integrity conflict, never a reason to construct another event.
-        throw new TransactionIntegrityError();
+      case "applied": return { kind: "already_applied", idempotency_key: idempotencyKey, original_event_id: existing.event_id, original_receipt: existing.receipt };
+      case "deferred_conflict": return { kind: "deferred_conflict", event_id: existing.event_id, receipt: existing.receipt };
+      case "failed": return { kind: "failed", event_id: existing.event_id, receipt: existing.receipt };
+      default: throw new TransactionIntegrityError();
     }
   }
 
-  private async outcomeApplied(input: TransactionInput, target: WritePlan): Promise<CheckpointOutcome> {
-    const receipt: Receipt = await this.journal.writeReceipt({
-      version: 1,
-      outcome: "applied",
-      event_id: input.event_id,
-      idempotency_key: input.idempotency_key,
-      targets: [{ path: target.path, before_hash: target.before_hash, after_hash: target.after_hash }],
-      created_at: nowIso(this.now),
-    });
+  private async outcomeApplied(input: TransactionInput): Promise<CheckpointOutcome> {
+    const receipt: Receipt = await this.journal.writeReceipt({ version: 1, outcome: "applied", event_id: input.event_id, idempotency_key: input.idempotency_key, targets: this.targets(input), created_at: nowIso(this.now) });
     if (receipt.outcome !== "applied") throw new TransactionIntegrityError();
     return { kind: "applied", event_id: input.event_id, receipt };
   }
 
-  private async applyLocked(input: TransactionInput, target: WritePlan): Promise<CheckpointOutcome> {
+  private async applyLocked(input: TransactionInput): Promise<CheckpointOutcome> {
     const paths = await this.pathsPromise;
-    let resolved;
-    try { resolved = await paths.resolveWrite(target.path); }
-    catch { return this.deferConflict(input, target.path); }
-
     const progressDirectory = path.join(this.backupRoot, String(input.event_id));
-    let progress: ProgressRecord | null;
-    try { progress = await readProgress(this.stateRoot, progressDirectory, input.event_id, target.path); }
-    catch (error) {
-      if (error instanceof ProgressIntegrityError) throw error;
-      return this.outcomeFailed(input, "invalid_state", target);
-    }
-    if (progress?.state === "renamed") {
+    const prepared: Array<{ plan: WritePlan; absolute: string; before: TargetSnapshot; progress: ProgressRecord }> = [];
+    const conflicts: VaultPath[] = [];
+    const staleTemps: Array<{ absolute: string; temp_name: string }> = [];
+    for (const plan of input.plans) {
+      let resolved;
+      try { resolved = await paths.resolveWrite(plan.path); } catch { conflicts.push(plan.path); continue; }
+      let progress: ProgressRecord | null;
+      try { progress = await readProgress(this.stateRoot, progressDirectory, input.event_id, plan.path); }
+      catch { throw new ProgressIntegrityError(); }
+      if (progress !== null && (progress.before_hash !== plan.before_hash || progress.after_hash !== plan.after_hash)) throw new ProgressIntegrityError();
       const current = await readSnapshot(resolved.absolute);
-      if (progress.before_hash !== target.before_hash || progress.after_hash !== target.after_hash) {
-        throw new TransactionIntegrityError();
+      if (progress !== null && current.exists && current.hash === plan.after_hash) {
+        if (progress.state === "prepared") {
+          progress = { ...progress, state: "renamed" };
+          await writeProgress(this.stateRoot, progressDirectory, progress);
+        }
+        prepared.push({ plan, absolute: resolved.absolute, before: current, progress });
+        continue;
       }
-      if (current.exists && current.hash === progress.after_hash) {
-        // Durable renamed progress plus an exact after-hash is a completed
-        // write whose receipt was lost; never reinterpret it as a conflict.
-        return this.outcomeApplied(input, target);
+      if (await hasConflictCopy(path.dirname(resolved.absolute), path.basename(resolved.absolute))) {
+        if (progress?.state === "prepared") staleTemps.push({ absolute: resolved.absolute, temp_name: progress.temp_name });
+        conflicts.push(plan.path);
+        continue;
       }
+      if (current.hash !== plan.before_hash || current.exists !== (plan.before_hash !== null)) {
+        if (progress?.state === "prepared") staleTemps.push({ absolute: resolved.absolute, temp_name: progress.temp_name });
+        conflicts.push(plan.path);
+        continue;
+      }
+      await backupSnapshot(this.stateRoot, this.backupRoot, input.event_id, plan.path, current);
+      let temporary: string;
+      if (progress?.state === "prepared") {
+        temporary = path.join(path.dirname(resolved.absolute), progress.temp_name);
+        const temporaryStat = await lstat(temporary, { bigint: true }).catch(() => null);
+        if (temporaryStat === null || !temporaryStat.isFile() || temporaryStat.isSymbolicLink()) throw new ProgressIntegrityError();
+        let preparedContent: string;
+        try { preparedContent = await readFile(temporary, "utf8"); } catch { throw new ProgressIntegrityError(); }
+        if (hashContent(preparedContent) !== plan.after_hash) throw new ProgressIntegrityError();
+      } else {
+        temporary = await this.prepareAtomic(resolved.absolute, plan.after_content, current.mode, current);
+        progress = { version: 2, event_id: input.event_id, path: plan.path, before_hash: plan.before_hash, after_hash: plan.after_hash, temp_name: path.basename(temporary), state: "prepared" };
+        await writeProgress(this.stateRoot, progressDirectory, progress);
+      }
+      prepared.push({ plan, absolute: resolved.absolute, before: current, progress });
+    }
+    if (conflicts.length > 0) {
+      try {
+        const cleanup = [
+          ...prepared.filter((item) => item.progress.state === "prepared").map((item) => ({ absolute: item.absolute, temp_name: item.progress.temp_name })),
+          ...staleTemps,
+        ];
+        for (const item of cleanup) {
+          await unlink(path.join(path.dirname(item.absolute), item.temp_name));
+          await directorySync(path.dirname(item.absolute));
+        }
+      } catch { return this.outcomeFailed(input, "io_error"); }
+      return this.deferConflict(input, conflicts);
     }
 
-    if (await hasConflictCopy(path.dirname(resolved.absolute), path.basename(resolved.absolute))) {
-      return this.deferConflict(input, target.path);
-    }
-    let before: TargetSnapshot;
-    try { before = await readSnapshot(resolved.absolute); }
-    catch { return this.deferConflict(input, target.path); }
-    if (before.exists !== (target.before_hash !== null) || before.hash !== target.before_hash) {
-      return this.deferConflict(input, target.path);
-    }
-    try { await backupSnapshot(this.stateRoot, this.backupRoot, input.event_id, target.path, before); }
-    catch { return this.outcomeFailed(input, "io_error", target); }
-
-    try {
-      await writeProgress(this.stateRoot, progressDirectory, {
-        version: 1,
-        event_id: input.event_id,
-        path: target.path,
-        before_hash: target.before_hash,
-        after_hash: target.after_hash,
-        state: "prepared",
-      });
+    for (let index = 0; index < prepared.length; index += 1) {
+      const item = prepared[index]!;
+      if (item.progress.state === "renamed") continue;
       const beforeRename = input.hooks?.beforeRename ?? this.beforeRename;
-      await this.writeAtomic(resolved.absolute, target.after_content, before.mode, before, beforeRename);
-      await writeProgress(this.stateRoot, progressDirectory, {
-        version: 1,
-        event_id: input.event_id,
-        path: target.path,
-        before_hash: target.before_hash,
-        after_hash: target.after_hash,
-        state: "renamed",
-      });
-      const afterRename = input.hooks?.afterRename ?? this.afterRename;
-      if (afterRename !== undefined) await afterRename();
-    } catch (error) {
-      // This typed seam models process death: no failed receipt is truthful
-      // after durable rename/progress, and the next invocation must recover.
-      if (error instanceof TransactionCrashError) throw error;
-      return this.outcomeFailed(input, "io_error", target);
+      try {
+        await this.publishAtomic(item.absolute, path.join(path.dirname(item.absolute), item.progress.temp_name), item.before, beforeRename === undefined ? undefined : () => beforeRename(item.plan, index));
+        // Crash seam: between durable rename and durable progress update. A
+        // crash here leaves the file in the after state and progress in
+        // "prepared"; the next apply recovers by observing the after hash and
+        // rewriting progress to "renamed".
+        const afterRenamePreProgress = input.hooks?.afterRenamePreProgress ?? this.afterRenamePreProgress;
+        if (afterRenamePreProgress !== undefined) await afterRenamePreProgress(item.plan, index);
+        const renamed: ProgressRecord = { ...item.progress, state: "renamed" };
+        await writeProgress(this.stateRoot, progressDirectory, renamed);
+        const afterRename = input.hooks?.afterRename ?? this.afterRename;
+        if (afterRename !== undefined) await afterRename(item.plan, index);
+      } catch (error) {
+        if (error instanceof TransactionCrashError) throw error;
+        await unlink(path.join(path.dirname(item.absolute), item.progress.temp_name)).catch(() => undefined);
+        return this.outcomeFailed(input, "io_error");
+      }
     }
-    return this.outcomeApplied(input, target);
+    return this.outcomeApplied(input);
   }
 
   async apply(value: unknown): Promise<CheckpointOutcome> {
@@ -724,8 +726,7 @@ export class TransactionService {
     const effectiveInput: TransactionInput = effectiveEventId === input.event_id
       ? input
       : { ...input, event_id: effectiveEventId };
-    const target = effectiveInput.plans[0];
-    if (target === undefined) throw new TransactionScopeError();
+    if (effectiveInput.plans.length === 0) throw new TransactionScopeError();
     const event: JournalEventInput = priorEvent !== null
       ? priorEvent
       : {
@@ -735,21 +736,21 @@ export class TransactionService {
           idempotency_key: effectiveInput.idempotency_key,
           created_at: nowIso(this.now),
           checkpoint: effectiveInput.checkpoint,
-          planned_targets: [{ path: target.path, before_hash: target.before_hash, after_hash: target.after_hash }],
+          planned_targets: this.targets(effectiveInput),
         };
     try {
       if (priorEvent === null) await this.journal.writeEvent(event);
     }
     catch (error) {
-      if (error instanceof JournalIntegrityError) return this.outcomeFailed(effectiveInput, "io_error", target);
+      if (error instanceof JournalIntegrityError) return this.outcomeFailed(effectiveInput, "io_error");
       throw error;
     }
 
     let held: LockHandle;
     try { held = await this.lock.acquire(); }
     catch (error) {
-      if (error instanceof LockTimeoutError) return this.outcomeFailed(effectiveInput, "lock_unavailable", target);
-      return this.outcomeFailed(effectiveInput, "io_error", target);
+      if (error instanceof LockTimeoutError) return this.outcomeFailed(effectiveInput, "lock_unavailable");
+      return this.outcomeFailed(effectiveInput, "io_error");
     }
 
     let operationOutcome: CheckpointOutcome | undefined;
@@ -759,7 +760,7 @@ export class TransactionService {
       // have published a receipt while this invocation was waiting.
       const lockedExisting = await this.journal.findReceiptByIdempotency(effectiveInput.idempotency_key);
       operationOutcome = lockedExisting === null
-        ? await this.applyLocked(effectiveInput, target)
+        ? await this.applyLocked(effectiveInput)
         : this.outcomeFromReceipt(lockedExisting, effectiveInput.idempotency_key);
     } catch (error) {
       operationError = error;
@@ -782,7 +783,7 @@ export class TransactionService {
         return operationOutcome;
       }
       if (persisted !== null) throw new TransactionIntegrityError();
-      try { return await this.outcomeFailed(effectiveInput, "io_error", target); }
+      try { return await this.outcomeFailed(effectiveInput, "io_error"); }
       catch { throw new TransactionIntegrityError(); }
     }
     if (operationError !== undefined) throw operationError;
@@ -790,11 +791,58 @@ export class TransactionService {
     return operationOutcome;
   }
 
-  private async deferConflict(input: TransactionInput, targetPath: VaultPath): Promise<CheckpointOutcome> {
+  /** Replay one journaled apply from durable prepared temp files.
+   * Missing progress (including a mid-prepare frontier) stays pending and is
+   * surfaced to the recovery batch as `MissingProgressError`; no terminal
+   * receipt is invented. Corrupt or hash-mismatched durable progress remains
+   * a fatal integrity error. */
+  async recoverEvent(event: JournalEvent): Promise<CheckpointOutcome> {
+    if (event.kind !== "apply") throw new TransactionIntegrityError();
+    const progressDirectory = path.join(this.backupRoot, String(event.event_id));
+    const paths = await this.pathsPromise;
+    const sortedTargets = [...event.planned_targets].sort((left, right) => String(left.path).localeCompare(String(right.path)));
+    const progressByTarget: Array<{ target: typeof sortedTargets[number]; progress: ProgressRecord | null }> = [];
+    for (const target of sortedTargets) {
+      // A directory that does not yet exist means the event never started a
+      // prepared frontier for that target; map that to a recoverable
+      // "missing_progress" outcome instead of treating it as corruption.
+      const dirExists = await existingPrivateDirectory(this.stateRoot, progressDirectory);
+      const progress = dirExists
+        ? await readProgress(this.stateRoot, progressDirectory, event.event_id, target.path)
+        : null;
+      progressByTarget.push({ target, progress });
+    }
+    const missing = progressByTarget.filter((entry) => entry.progress === null);
+    const present = progressByTarget.filter((entry) => entry.progress !== null);
+    if (missing.length > 0) throw new MissingProgressError(event.event_id);
+    const plans: WritePlan[] = [];
+    for (const entry of present) {
+      const progress = entry.progress as ProgressRecord;
+      const target = entry.target;
+      if (progress.before_hash !== target.before_hash || progress.after_hash !== target.after_hash) throw new ProgressIntegrityError();
+      const resolved = await paths.resolveWrite(target.path);
+      let afterContent: string;
+      const current = await readSnapshot(resolved.absolute);
+      if (current.hash === target.after_hash) afterContent = current.content;
+      else {
+        const temporary = path.join(path.dirname(resolved.absolute), progress.temp_name);
+        let prepared: string;
+        try { prepared = await readFile(temporary, "utf8"); } catch { throw new ProgressIntegrityError(); }
+        if (hashContent(prepared) !== target.after_hash) throw new ProgressIntegrityError();
+        afterContent = prepared;
+      }
+      plans.push({ path: target.path, before_hash: target.before_hash, after_hash: target.after_hash, after_content: afterContent, reason: "daily_update" });
+    }
+    return this.apply({ checkpoint: event.checkpoint, event_id: event.event_id, idempotency_key: event.idempotency_key, plans });
+  }
+
+
+  private async deferConflict(input: TransactionInput, conflictPaths: VaultPath[]): Promise<CheckpointOutcome> {
+    const unique = [...new Set(conflictPaths)].sort();
     let proposalPath: VaultPath;
-    try { proposalPath = await this.writeConflictProposal(input, targetPath); }
-    catch { return this.outcomeFailed(input, "io_error", input.plans[0]!); }
-    const receipt = await this.journal.writeReceipt({ version: 1, outcome: "deferred_conflict", event_id: input.event_id, idempotency_key: input.idempotency_key, proposal_path: proposalPath, conflict_paths: [targetPath], targets: [{ path: targetPath, before_hash: input.plans[0]!.before_hash, after_hash: input.plans[0]!.after_hash }], created_at: nowIso(this.now) });
+    try { proposalPath = await this.writeConflictProposal(input, unique[0] ?? input.plans[0]!.path); }
+    catch { return this.outcomeFailed(input, "io_error"); }
+    const receipt = await this.journal.writeReceipt({ version: 1, outcome: "deferred_conflict", event_id: input.event_id, idempotency_key: input.idempotency_key, proposal_path: proposalPath, conflict_paths: unique, targets: this.targets(input), created_at: nowIso(this.now) });
     if (receipt.outcome !== "deferred_conflict") throw new TransactionIntegrityError();
     return { kind: "deferred_conflict", event_id: input.event_id, receipt };
   }

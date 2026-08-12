@@ -156,7 +156,9 @@ describe("TransactionService single-target apply", () => {
     const backupFile = backupNames.find((name) => name.endsWith(".before"));
     expect(backupFile).toBeDefined();
     expect(await readFile(path.join(backupDir, backupFile!), "utf8")).toBe(before);
-    const progress = JSON.parse(await readFile(path.join(backupDir, "progress.json"), "utf8")) as Record<string, unknown>;
+    const progressName = backupNames.find((name) => name.startsWith("progress-"));
+    expect(progressName).toBeDefined();
+    const progress = JSON.parse(await readFile(path.join(backupDir, progressName!), "utf8")) as Record<string, unknown>;
     expect(progress).toMatchObject({ event_id: "evt-task8", state: "renamed", path: "Notas Diarias/2026-08-11.md" });
     expect(backupNames.some((name) => name.includes(".tmp") || name.includes(".resyst-"))).toBe(false);
     const retried = await tx.apply(request);
@@ -202,8 +204,9 @@ describe("TransactionService single-target apply", () => {
     expect(await journal.findEventByIdempotency("e".repeat(64))).not.toBeNull();
     if (failed.kind === "failed") expect(failed.receipt.reason).toBe("io_error");
     const backupDir = path.join(tx.backupRoot, "evt-failure");
-    expect(await readdir(backupDir)).toEqual(expect.arrayContaining(["progress.json"]));
-    expect(JSON.parse(await readFile(path.join(backupDir, "progress.json"), "utf8"))).toMatchObject({ state: "prepared" });
+    const [progressName] = (await readdir(backupDir)).filter((name) => name.startsWith("progress-"));
+    expect(progressName).toBeDefined();
+    expect(JSON.parse(await readFile(path.join(backupDir, progressName!), "utf8"))).toMatchObject({ state: "prepared" });
     expect((await readdir(path.dirname(target))).some((name) => name.includes(".resyst-"))).toBe(false);
   });
 
@@ -248,7 +251,9 @@ describe("TransactionService single-target apply", () => {
     })).rejects.toBeInstanceOf(TransactionCrashError);
     expect(await readFile(target, "utf8")).toBe(before + "after crash");
     const backupDir = path.join(tx.backupRoot, "evt-crash");
-    expect(JSON.parse(await readFile(path.join(backupDir, "progress.json"), "utf8"))).toMatchObject({ state: "renamed" });
+    const [progressName] = (await readdir(backupDir)).filter((name) => name.startsWith("progress-"));
+    expect(progressName).toBeDefined();
+    expect(JSON.parse(await readFile(path.join(backupDir, progressName!), "utf8"))).toMatchObject({ state: "renamed" });
     const recovered = await tx.apply(request);
     expect(recovered.kind).toBe("applied");
     const retried = await tx.apply(request);
@@ -265,7 +270,10 @@ describe("TransactionService single-target apply", () => {
       ...request,
       hooks: { afterRename: async () => { throw new TransactionCrashError(); } },
     })).rejects.toBeInstanceOf(TransactionCrashError);
-    await writeFile(path.join(tx.backupRoot, "evt-corrupt-progress", "progress.json"), "{}", "utf8");
+    const progressDirectory = path.join(tx.backupRoot, "evt-corrupt-progress");
+    const [progressName] = (await readdir(progressDirectory)).filter((name) => name.startsWith("progress-"));
+    expect(progressName).toBeDefined();
+    await writeFile(path.join(progressDirectory, progressName!), "{}", "utf8");
     await expect(tx.apply(request)).rejects.toBeInstanceOf(TransactionIntegrityError);
     expect(await readFile(target, "utf8")).toBe(before + "corrupt");
   });
@@ -331,6 +339,26 @@ describe("TransactionService single-target apply", () => {
     await rename(replacement, root);
     await expect(tx.apply(input(before + "new", hash(before), "1".repeat(64), "evt-root"))).rejects.toBeInstanceOf(JournalIntegrityError);
   });
+  it("recovers from a crash between durable rename and progress update by repairing the frontier and finishing idempotently", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "resyst-tx-preprogress-")); roots.push(root);
+    await createVault({ vaultPath: root, withDailyNote: true });
+    const { absolute: target, before } = await targetSource(root);
+    const tx = await service(root);
+    const request = input(before + "after pre-progress crash", hash(before), "9".repeat(64), "evt-preprogress");
+    await expect(tx.apply({
+      ...request,
+      hooks: { afterRenamePreProgress: async () => { throw new TransactionCrashError(); } },
+    })).rejects.toBeInstanceOf(TransactionCrashError);
+    // After the seam, the file is in the after state but progress is still
+    // "prepared". Re-applying must observe the after hash, repair the
+    // frontier to "renamed", and complete the apply with one durable receipt.
+    expect(await readFile(target, "utf8")).toBe(before + "after pre-progress crash");
+    const recovered = await tx.apply(request);
+    expect(recovered.kind).toBe("applied");
+    const retried = await tx.apply(request);
+    expect(retried.kind).toBe("already_applied");
+  });
+
   it("fails closed when the machine-local backups parent is symlinked", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "resyst-tx-state-link-")); roots.push(root);
     await createVault({ vaultPath: root, withDailyNote: true });
@@ -352,8 +380,7 @@ describe("TransactionService single-target apply", () => {
       journal: new JournalStore({ vaultRoot: root, identity }),
       lock: new LocalLock({ stateRoot, pid: process.pid, processStart: "test-start" }),
     });
-    const result = await tx.apply(input(before + "changed", hash(before), "2".repeat(64), "evt-state-link"));
-    expect(result.kind).toBe("failed");
+    await expect(tx.apply(input(before + "changed", hash(before), "2".repeat(64), "evt-state-link"))).rejects.toBeInstanceOf(TransactionIntegrityError);
     expect(await readdir(outside)).toEqual([]);
   });
 
