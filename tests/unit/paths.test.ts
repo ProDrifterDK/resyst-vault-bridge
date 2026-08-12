@@ -35,10 +35,10 @@ interface PathsContext {
   outsideDir: string;
 }
 
-/** Capture the config-style identity of a vault root (realpath + dev/ino). */
+/** Capture the config-style identity of a vault root (realpath + bigint dev/ino). */
 async function vaultIdentityOf(vaultPath: string): Promise<VaultRootIdentity> {
   const real = await realpath(vaultPath);
-  const rootStat = await stat(vaultPath);
+  const rootStat = await stat(vaultPath, { bigint: true });
   return { real_path: real, dev: rootStat.dev, ino: rootStat.ino };
 }
 
@@ -124,8 +124,8 @@ function nonRegularTargetFs(
             isFile: () => false,
             isDirectory: () => false,
             isSymbolicLink: () => false,
-            dev: 0,
-            ino: 0,
+            dev: 0n,
+            ino: 0n,
           };
         }
         return nodeVaultPathsFs.lstat(filePath);
@@ -744,6 +744,66 @@ describe("VaultPaths: config-trusted root identity (no trust-on-first-use)", () 
       await rm(link);
       await mkdir(link);
       const paths = new VaultPaths(link, { identity: ctx.identity, fs: nodeVaultPathsFs });
+      const err = await capture(() => paths.resolveWrite("note.md"));
+      expect(err).toBeDefined();
+      expect(err?.code).toBe("symlink_escape");
+    });
+  });
+});
+
+describe("VaultPaths: lossless bigint filesystem identity", () => {
+  it("nodeVaultPathsFs exposes bigint dev/ino from stat", async () => {
+    await withPaths(async (ctx) => {
+      const rootStat = await nodeVaultPathsFs.stat(ctx.vault.vaultPath);
+      expect(typeof rootStat.dev).toBe("bigint");
+      expect(typeof rootStat.ino).toBe("bigint");
+      expect(rootStat.isDirectory()).toBe(true);
+    });
+  });
+
+  it("nodeVaultPathsFs exposes bigint dev/ino from lstat", async () => {
+    await withPaths(async (ctx) => {
+      const noteStat = await nodeVaultPathsFs.lstat(ctx.vault.paths.claudeMd);
+      expect(typeof noteStat.dev).toBe("bigint");
+      expect(typeof noteStat.ino).toBe("bigint");
+      expect(noteStat.isFile()).toBe(true);
+    });
+  });
+
+  it("rejects a replacement whose inode differs by 1n above 2^53 (Number collision)", async () => {
+    await withPaths(async (ctx) => {
+      // True inodes 2^53+1n and 2^53n both collapse to Number 9007199254740992.
+      // The trusted identity carries the true inode; the replacement differs
+      // by exactly 1n and must be rejected even though a Number comparison
+      // would see them as equal.
+      const trusted = {
+        real_path: ctx.vault.vaultPath,
+        dev: 1n,
+        ino: 9_007_199_254_740_993n,
+      };
+      let currentIno = 9_007_199_254_740_993n;
+      const fs: VaultPathsFs = {
+        realpath: async () => ctx.vault.vaultPath,
+        stat: async () => ({
+          isDirectory: () => true,
+          isFile: () => false,
+          dev: 1n,
+          ino: currentIno,
+        }),
+        lstat: async () => ({
+          isDirectory: () => false,
+          isFile: () => true,
+          isSymbolicLink: () => false,
+          dev: 1n,
+          ino: currentIno,
+        }),
+      };
+      const paths = new VaultPaths(ctx.vault.vaultPath, {
+        identity: trusted,
+        fs,
+      });
+      await paths.resolveWrite("note.md");
+      currentIno = 9_007_199_254_740_992n; // replacement root: 1n lower, same Number
       const err = await capture(() => paths.resolveWrite("note.md"));
       expect(err).toBeDefined();
       expect(err?.code).toBe("symlink_escape");

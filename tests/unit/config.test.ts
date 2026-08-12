@@ -1482,20 +1482,30 @@ describe("loadConfig: layout realpath containment", () => {
 });
 
 describe("loadConfig: validated vault root identity", () => {
-  it("captures the exact dev/ino identity of the validated vault root", async () => {
+  it("captures the exact bigint dev/ino identity of the validated vault root", async () => {
     await withVault(async (ctx) => {
       await writeLocalConfig(ctx, { version: 1, host_id: "workstation", vault_path: ctx.vault.vaultPath });
       const cfg = await load(ctx);
-      const rootStat = await stat(ctx.vault.vaultPath);
+      const rootStat = await stat(ctx.vault.vaultPath, { bigint: true });
       expect(cfg.vault_identity).toEqual({
         real_path: await realpath(ctx.vault.vaultPath),
         dev: rootStat.dev,
         ino: rootStat.ino,
       });
+      expect(typeof cfg.vault_identity.dev).toBe("bigint");
+      expect(typeof cfg.vault_identity.ino).toBe("bigint");
       expectTypeOf(cfg.vault_identity).toEqualTypeOf<VaultRootIdentity>();
       expectTypeOf(cfg.vault_identity.real_path).toEqualTypeOf<string>();
-      expectTypeOf(cfg.vault_identity.dev).toEqualTypeOf<number>();
-      expectTypeOf(cfg.vault_identity.ino).toEqualTypeOf<number>();
+      expectTypeOf(cfg.vault_identity.dev).toEqualTypeOf<bigint>();
+      expectTypeOf(cfg.vault_identity.ino).toEqualTypeOf<bigint>();
+    });
+  });
+
+  it("nodeConfigFs exposes bigint dev/ino from stat", async () => {
+    await withVault(async (ctx) => {
+      const rootStat = await nodeConfigFs.stat(ctx.vault.vaultPath);
+      expect(typeof rootStat.dev).toBe("bigint");
+      expect(typeof rootStat.ino).toBe("bigint");
     });
   });
 

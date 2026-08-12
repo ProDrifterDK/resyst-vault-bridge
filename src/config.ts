@@ -111,12 +111,12 @@ export class ConfigError extends Error {
   }
 }
 
-/** Directory/file shape plus filesystem identity from a stat call. */
+/** Directory/file shape plus lossless bigint identity from a stat call. */
 interface ConfigStat {
   isDirectory(): boolean;
   isFile(): boolean;
-  dev: number;
-  ino: number;
+  dev: bigint;
+  ino: bigint;
 }
 
 /** Minimal filesystem seam so tests never touch the real home or vault. */
@@ -126,10 +126,13 @@ export interface ConfigFs {
   realpath(filePath: string): Promise<string>;
 }
 
-/** Node `fs/promises` adapter for {@link ConfigFs}. */
+/**
+ * Node `fs/promises` adapter for {@link ConfigFs}. `stat` uses the
+ * `bigint: true` option so the captured vault identity is lossless.
+ */
 export const nodeConfigFs: ConfigFs = {
   readFile: (filePath) => readFile(filePath, "utf8"),
-  stat,
+  stat: (filePath) => stat(filePath, { bigint: true }),
   realpath,
 };
 
@@ -200,9 +203,11 @@ export interface BridgeConfig {
   /** Absolute vault path exactly as configured locally. */
   vault_path: string;
   /**
-   * Config-validated vault root identity (resolved real path + dev/ino).
-   * The single source of truth for the containment root; `VaultPaths`
-   * requires it at construction and re-verifies it on every resolve.
+   * Config-validated vault root identity (resolved real path + bigint
+   * dev/ino). The single source of truth for the containment root; `VaultPaths`
+   * requires it at construction and re-verifies it on every resolve. This is
+   * in-memory local runtime state, not wire data: it must never be JSON
+   * serialized (`JSON.stringify` throws on `bigint` by design).
    */
   vault_identity: VaultRootIdentity;
   layout: PortableConfig["layout"];

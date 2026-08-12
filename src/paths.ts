@@ -84,9 +84,10 @@ export class VaultPathError extends Error {
 
 /**
  * Minimal filesystem seam so tests never touch the real vault. `stat`/`lstat`
- * must expose the filesystem identity (`dev`/`ino`) so the vault root can be
- * pinned and re-verified on every resolve (Node `Stats` provides both on
- * POSIX with Node >= 22).
+ * must expose the lossless filesystem identity (`dev`/`ino` as `bigint`) so
+ * the vault root can be pinned and re-verified on every resolve. Node's
+ * `BigIntStats` (from `stat(path, { bigint: true })`) provides both on POSIX
+ * with Node >= 22; do not coerce through `Number`.
  */
 export interface VaultPathsFs {
   realpath(filePath: string): Promise<string>;
@@ -94,11 +95,14 @@ export interface VaultPathsFs {
   lstat(filePath: string): Promise<LStatLike>;
 }
 
-/** Node `fs/promises` adapter for {@link VaultPathsFs}. */
+/**
+ * Node `fs/promises` adapter for {@link VaultPathsFs}. `stat`/`lstat` use the
+ * `bigint: true` option so `dev`/`ino` are exact `bigint` values end-to-end.
+ */
 export const nodeVaultPathsFs: VaultPathsFs = {
   realpath,
-  stat,
-  lstat,
+  stat: (filePath) => stat(filePath, { bigint: true }),
+  lstat: (filePath) => lstat(filePath, { bigint: true }),
 };
 
 /**
@@ -181,14 +185,20 @@ function lexicalSegments(
  * Config-validated vault root identity. Produced by `loadConfig` after vault
  * validation and REQUIRED by {@link VaultPaths} at construction; VaultPaths
  * never trusts whatever the filesystem shows on first use.
+ *
+ * `dev`/`ino` are lossless `bigint` values captured with
+ * `stat(path, { bigint: true })` so identities above 2^53 never collapse.
+ * This is local runtime state, not wire data: it must never be JSON
+ * serialized (`JSON.stringify` throws on `bigint` by design, which is the
+ * intended fail-closed behavior).
  */
 export interface VaultRootIdentity {
   /** Symlink-resolved absolute vault root path. */
   real_path: string;
-  /** Device number of the resolved root directory (Node `Stats.dev`). */
-  dev: number;
-  /** Inode number of the resolved root directory (Node `Stats.ino`). */
-  ino: number;
+  /** Device number of the resolved root directory (`BigIntStats.dev`). */
+  dev: bigint;
+  /** Inode number of the resolved root directory (`BigIntStats.ino`). */
+  ino: bigint;
 }
 
 /** Options for {@link VaultPaths}. The trusted identity is required. */
@@ -402,12 +412,12 @@ export class VaultPaths {
   }
 }
 
-/** Directory/file shape plus filesystem identity shared by stat results. */
+/** Directory/file shape plus lossless bigint identity shared by stat results. */
 interface StatLike {
   isDirectory(): boolean;
   isFile(): boolean;
-  dev: number;
-  ino: number;
+  dev: bigint;
+  ino: bigint;
 }
 
 /** lstat result shape that additionally distinguishes symlinks. */
