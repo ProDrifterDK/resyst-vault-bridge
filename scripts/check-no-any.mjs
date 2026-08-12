@@ -19,8 +19,9 @@
  * - sha256:    lowercase hex SHA-256 of the exact source line (bytes up to
  *              but excluding the line terminator) at <path>:<line>.
  * - test-path: canonical repo-relative POSIX path (`.ts`/`.tsx`) of a
- *              regression test that exercises the exception; must resolve
- *              inside <root>/tests and exist.
+ *              regression test that exercises the exception; resolved once
+ *              against the repo root, that exact path must live inside
+ *              <root>/tests and exist.
  * - rationale: nonempty free-text justification (the remainder of the line,
  *              so it may contain further `|` characters).
  *
@@ -152,16 +153,22 @@ function parseAllowlist(allowlistPath) {
       errors.push(`allowlist ${number}: sha256 must be 64 lowercase hex chars: ${raw}`);
       continue;
     }
-    const testError = canonicalPosixPath(
-      testPath ?? "",
-      [".ts", ".tsx"],
-      path.join(ROOT, "tests"),
-    );
+    const testError = canonicalPosixPath(testPath ?? "", [".ts", ".tsx"], ROOT);
     if (testError) {
       errors.push(`allowlist ${number}: ${testError}: ${raw}`);
       continue;
     }
-    if (!existsSync(path.join(ROOT, testPath))) {
+    // Resolve the repo-relative test-path exactly once against ROOT and
+    // require that exact resolved path to live inside <root>/tests.
+    const resolvedTest = path.resolve(ROOT, testPath);
+    const testsBase = path.resolve(ROOT, "tests");
+    if (resolvedTest === testsBase || !resolvedTest.startsWith(testsBase + path.sep)) {
+      errors.push(
+        `allowlist ${number}: test-path must resolve inside <root>/tests: ${raw}`,
+      );
+      continue;
+    }
+    if (!existsSync(resolvedTest)) {
       errors.push(`allowlist ${number}: test-path does not exist: ${testPath}`);
       continue;
     }

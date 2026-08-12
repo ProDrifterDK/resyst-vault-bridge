@@ -157,6 +157,24 @@ describe("check:no-any gate", () => {
     });
   });
 
+  it("rejects an existing source file masquerading as a regression test", () => {
+    withProbeDir((dir) => {
+      const bad = path.join(dir, "masquerade.ts");
+      writeFileSync(bad, BAD_LINE);
+      const first = runGate([bad]);
+      const match = /required allowlist entry: (\S+)/.exec(first.stderr);
+      expect(match).not.toBeNull();
+      const skeleton = match?.[1] ?? "";
+      // `src/types.ts` exists but is not inside <root>/tests.
+      const entry = `${skeleton.slice(0, -2)}|src/types.ts|masquerading test`;
+      const allowlist = path.join(dir, "allow-masquerade.txt");
+      writeFileSync(allowlist, `${entry}\n`);
+      const second = runGate(["--allowlist", allowlist, bad]);
+      expect(second.status).toBe(1);
+      expect(second.stderr).toContain("inside <root>/tests");
+    });
+  });
+
   it("rejects an entry whose regression-test path is absent", () => {
     withProbeDir((dir) => {
       const bad = path.join(dir, "no-test.ts");
