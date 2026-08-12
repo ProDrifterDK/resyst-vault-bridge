@@ -68,6 +68,22 @@ function memoryFs(files: MemoryFile[], cwdPaths: string[] = []): ProjectFs {
         dirent(name, isDirectory),
       );
     },
+    async stat(filePath) {
+      if (!dirs.has(filePath) && !fileMap.has(filePath)) {
+        const error = new Error("missing") as NodeJS.ErrnoException;
+        error.code = "ENOENT";
+        throw error;
+      }
+      return defaultSyntheticStat(filePath);
+    },
+    async lstat(filePath) {
+      if (!dirs.has(filePath) && !fileMap.has(filePath)) {
+        const error = new Error("missing") as NodeJS.ErrnoException;
+        error.code = "ENOENT";
+        throw error;
+      }
+      return defaultSyntheticStat(filePath);
+    },
     async realpath(filePath) {
       if (dirs.has(filePath) || fileMap.has(filePath)) return filePath;
       const error = new Error("missing") as NodeJS.ErrnoException;
@@ -110,6 +126,62 @@ const git: GitRunner = async () => ({
 });
 
 const atlasNote = `---\ntitle: Atlas\nresyst_project:\n  id: atlas\n  repos:\n    - github.com/tester/atlas\n  aliases:\n    - Atlas Project\n---\n# Atlas\n`;
+
+// Keep the regression fixtures independent of implementation internals while
+// documenting the modest scanner budgets expected at the public seam.
+const TEST_MAX_NOTE_BYTES = 512 * 1024;
+const TEST_MAX_SCAN_ENTRIES = 4096;
+const TEST_MAX_SCAN_DIRECTORIES = 512;
+const TEST_MAX_SCAN_ENTRIES_PER_DIRECTORY = 256;
+const TEST_MAX_SCAN_DEPTH = 16;
+
+interface SyntheticStat {
+  isDirectory(): boolean;
+  isFile(): boolean;
+  isSymbolicLink(): boolean;
+  dev: bigint;
+  ino: bigint;
+}
+
+function syntheticStat(
+  filePath: string,
+  kind: "directory" | "file" | "other" | "symlink" = "file",
+  dev: bigint = 1n,
+  ino: bigint = 3n,
+): SyntheticStat {
+  void filePath;
+  return {
+    isDirectory: () => kind === "directory",
+    isFile: () => kind === "file" || kind === "symlink",
+    isSymbolicLink: () => kind === "symlink",
+    dev,
+    ino,
+  };
+}
+
+function defaultSyntheticStat(filePath: string): SyntheticStat {
+  if (filePath === "/vault") return syntheticStat(filePath, "directory", 1n, 2n);
+  const name = filePath.slice(filePath.lastIndexOf("/") + 1);
+  return syntheticStat(filePath, /\.[^/]+$/.test(name) ? "file" : "directory");
+}
+
+function boundaryFs(
+  base: ProjectFs,
+  options: {
+    stat?: (filePath: string) => SyntheticStat;
+    lstat?: (filePath: string) => SyntheticStat;
+    realpath?: (filePath: string) => Promise<string>;
+  } = {},
+): ProjectFs {
+  return {
+    ...base,
+    stat: async (filePath: string) =>
+      options.stat?.(filePath) ?? defaultSyntheticStat(filePath),
+    lstat: async (filePath: string) =>
+      options.lstat?.(filePath) ?? options.stat?.(filePath) ?? defaultSyntheticStat(filePath),
+    realpath: options.realpath ?? base.realpath,
+  } as unknown as ProjectFs;
+}
 
 describe("normalizeRemote", () => {
   it.each([
@@ -462,6 +534,392 @@ describe("unresolved, ambiguity, bounds, and association proposals", () => {
   });
 });
 
+
+describe("association proposal runtime boundary", () => {
+  const timestamp = "2026-08-11T12:00:00.000Z" as IsoTimestamp;
+
+  it("rejects a malicious unresolved reason instead of copying it", () => {
+    const input = {
+      kind: "unresolved",
+      reason: { toString: () => "attacker" },
+    } as unknown as Parameters<typeof buildAssociationProposal>[0];
+    expect(buildAssociationProposal(input, timestamp)).toBeNull();
+  });
+
+  it("rejects a malformed or non-UTC timestamp", () => {
+    const resolution = { kind: "unresolved", reason: "no_match" } as const;
+    expect(
+      buildAssociationProposal(
+        resolution,
+        "2026-08-11T12:00:00+01:00" as unknown as IsoTimestamp,
+      ),
+    ).toBeNull();
+    expect(
+      buildAssociationProposal(
+        resolution,
+        "not-a-timestamp" as unknown as IsoTimestamp,
+      ),
+    ).toBeNull();
+  });
+
+  it("sanitizes paths and mirrors the exact safe list inside ambiguity", () => {
+    const input = {
+      kind: "ambiguous",
+      candidates: [
+        "Projects/Atlas.md",
+        "Projects/Atlas.md",
+        "/secret/Atlas.md",
+        "../escape.md",
+        "Projects/Bad\u0000.md",
+        "Projects/Other.txt",
+      ],
+    } as unknown as Parameters<typeof buildAssociationProposal>[0];
+    const proposal = buildAssociationProposal(input, timestamp);
+    expect(proposal).toEqual({
+      version: 1,
+      kind: "association",
+      resolution: { kind: "ambiguous", candidates: ["Projects/Atlas.md"] },
+      candidates: ["Projects/Atlas.md"],
+      daily_write_only: true,
+      created_at: timestamp,
+    });
+  });
+
+  it("rejects oversized direct candidate arrays before materialization", () => {
+    const huge = Array.from(
+      { length: MAX_LEXICAL_CANDIDATES + 1 },
+      () => "Projects/Atlas.md" as VaultPath,
+    );
+    const unresolved = { kind: "unresolved", reason: "no_match" } as const;
+    expect(
+      buildAssociationProposal(
+        unresolved,
+        timestamp,
+        huge as unknown as readonly VaultPath[],
+      ),
+    ).toBeNull();
+    const ambiguous = {
+      kind: "ambiguous",
+      candidates: huge,
+    } as unknown as Parameters<typeof buildAssociationProposal>[0];
+    expect(buildAssociationProposal(ambiguous, timestamp)).toBeNull();
+  });
+});
+
+describe("scanner validation, bounded traversal, and exact fallback provenance", () => {
+  it("fails closed when the config-trusted vault root identity is replaced", async () => {
+    const base = memoryFs(
+      [{ path: "/vault/Proyectos/Atlas.md", source: "# Atlas\n" }],
+      ["/workspace/atlas"],
+    );
+    const fs = boundaryFs(base, {
+      stat: (filePath) =>
+        filePath === "/vault"
+          ? syntheticStat(filePath, "directory", 9n, 10n)
+          : defaultSyntheticStat(filePath),
+    });
+    const outcome = await resolveProjectWithCandidates({
+      cwd: "/workspace/atlas",
+      config: config(),
+      fs,
+      git: async () => ({ ok: true, stdout: "", stderr: "" }),
+    });
+    expect(outcome).toEqual({
+      resolution: { kind: "unresolved", reason: "unreadable" },
+      lexical_candidates: [],
+    });
+  });
+
+  it("fails closed when a traversed normal directory resolves outside the vault", async () => {
+    const base = memoryFs(
+      [{ path: "/vault/Proyectos/Atlas.md", source: "# Atlas\n" }],
+      ["/workspace/atlas"],
+    );
+    const fs = boundaryFs(base, {
+      realpath: async (filePath) =>
+        filePath === "/vault/Proyectos" ? "/outside/projects" : base.realpath(filePath),
+    });
+    const outcome = await resolveProjectWithCandidates({
+      cwd: "/workspace/atlas",
+      config: config(),
+      fs,
+      git: async () => ({ ok: true, stdout: "", stderr: "" }),
+    });
+    expect(outcome.resolution).toEqual({ kind: "unresolved", reason: "unreadable" });
+  });
+
+  it("rejects an injected outside note immediately before reading it", async () => {
+    const base = memoryFs([], ["/workspace/Injected"]);
+    const fs = boundaryFs({
+      ...base,
+      async readdir(filePath) {
+        if (filePath === "/vault/Proyectos") return [dirent("Injected.md", false)];
+        return base.readdir(filePath);
+      },
+      async readFile(filePath) {
+        if (filePath === "/vault/Proyectos/Injected.md") return "# Injected\n";
+        return base.readFile(filePath);
+      },
+    }, {
+      realpath: async (filePath) => {
+        if (filePath === "/vault/Proyectos/Injected.md") return "/outside/Injected.md";
+        return base.realpath(filePath);
+      },
+    });
+    const outcome = await resolveProjectWithCandidates({
+      cwd: "/workspace/Injected",
+      config: config(),
+      fs,
+      git: async () => ({ ok: true, stdout: "", stderr: "" }),
+    });
+    expect(outcome.resolution).toEqual({ kind: "unresolved", reason: "unreadable" });
+  });
+
+  it("rejects a note target that is a symlink or non-regular file", async () => {
+    for (const kind of ["symlink", "other"] as const) {
+      const base = memoryFs(
+        [{ path: "/vault/Proyectos/Atlas.md", source: "# Atlas\n" }],
+        ["/workspace/atlas"],
+      );
+      const fs = boundaryFs(base, {
+        lstat: (filePath) =>
+          filePath === "/vault/Proyectos/Atlas.md"
+            ? syntheticStat(filePath, kind)
+            : defaultSyntheticStat(filePath),
+        stat: (filePath) =>
+          filePath === "/vault/Proyectos/Atlas.md"
+            ? syntheticStat(filePath, kind)
+            : defaultSyntheticStat(filePath),
+        realpath: async (filePath) =>
+          filePath === "/vault/Proyectos/Atlas.md" && kind === "symlink"
+            ? "/outside/Atlas.md"
+            : base.realpath(filePath),
+      });
+      const outcome = await resolveProjectWithCandidates({
+        cwd: "/workspace/atlas",
+        config: config(),
+        fs,
+        git: async () => ({ ok: true, stdout: "", stderr: "" }),
+      });
+      expect(outcome.resolution).toEqual({ kind: "unresolved", reason: "unreadable" });
+    }
+  });
+
+  it("invalidates the complete scan on malformed delimited frontmatter", async () => {
+    const fs = boundaryFs(
+      memoryFs(
+        [
+          { path: "/vault/Proyectos/Atlas.md", source: "# Atlas\n" },
+          { path: "/vault/Proyectos/Zed.md", source: "---\ntitle: [\n---\n# Zed\n" },
+        ],
+        ["/workspace/atlas"],
+      ),
+    );
+    const outcome = await resolveProjectWithCandidates({
+      cwd: "/workspace/atlas",
+      config: config(),
+      fs,
+      git: async () => ({ ok: true, stdout: "", stderr: "" }),
+    });
+    expect(outcome).toEqual({
+      resolution: { kind: "unresolved", reason: "unreadable" },
+      lexical_candidates: [],
+    });
+  });
+
+  it("invalidates the complete scan on an oversized note after a valid note", async () => {
+    const fs = boundaryFs(
+      memoryFs(
+        [
+          { path: "/vault/Proyectos/Atlas.md", source: "# Atlas\n" },
+          { path: "/vault/Proyectos/Zed.md", source: "x".repeat(TEST_MAX_NOTE_BYTES + 1) },
+        ],
+        ["/workspace/atlas"],
+      ),
+    );
+    const outcome = await resolveProjectWithCandidates({
+      cwd: "/workspace/atlas",
+      config: config(),
+      fs,
+      git: async () => ({ ok: true, stdout: "", stderr: "" }),
+    });
+    expect(outcome.resolution).toEqual({ kind: "unresolved", reason: "unreadable" });
+  });
+
+  it("fails closed on conflicting exact canonical overrides", async () => {
+    const fs = boundaryFs(memoryFs([], ["/workspace/atlas"]));
+    const outcome = await resolveProjectWithCandidates({
+      cwd: "/workspace/atlas",
+      config: config([
+        { path: "/workspace/atlas", project_id: "atlas" as ProjectId },
+        { path: "/workspace/atlas", project_id: "other" as ProjectId },
+      ]),
+      fs,
+      git: async () => ({ ok: true, stdout: "", stderr: "" }),
+    });
+    expect(outcome.resolution).toEqual({ kind: "unresolved", reason: "unreadable" });
+    expect(outcome.resolution.kind).not.toBe("ambiguous");
+  });
+
+  it("rejects a very wide directory before scanning its materialized entries", async () => {
+    const files = Array.from(
+      { length: TEST_MAX_SCAN_ENTRIES_PER_DIRECTORY + 1 },
+      (_, index) => ({
+        path: `/vault/Proyectos/entry-${index}.txt`,
+        source: "ignored",
+      }),
+    );
+    const fs = boundaryFs(memoryFs(files, ["/workspace/atlas"]));
+    const outcome = await resolveProjectWithCandidates({
+      cwd: "/workspace/atlas",
+      config: config(),
+      fs,
+      git: async () => ({ ok: true, stdout: "", stderr: "" }),
+    });
+    expect(outcome.resolution).toEqual({ kind: "unresolved", reason: "unreadable" });
+  });
+
+  it("rejects total traversal work even when each directory is individually narrow", async () => {
+    const files: MemoryFile[] = [];
+    for (let directory = 0; directory < 20; directory += 1) {
+      for (let entry = 0; entry < TEST_MAX_SCAN_ENTRIES_PER_DIRECTORY; entry += 1) {
+        files.push({
+          path: `/vault/Proyectos/d${directory}/entry-${entry}.txt`,
+          source: "ignored",
+        });
+      }
+    }
+    expect(files.length).toBeGreaterThan(TEST_MAX_SCAN_ENTRIES);
+    const fs = boundaryFs(memoryFs(files, ["/workspace/atlas"]));
+    const outcome = await resolveProjectWithCandidates({
+      cwd: "/workspace/atlas",
+      config: config(),
+      fs,
+      git: async () => ({ ok: true, stdout: "", stderr: "" }),
+    });
+    expect(outcome.resolution).toEqual({ kind: "unresolved", reason: "unreadable" });
+  });
+
+  it("rejects total directory work independently of note and entry counts", async () => {
+    const files: MemoryFile[] = [];
+    for (let branch = 0; branch < 16; branch += 1) {
+      for (let leaf = 0; leaf < 32; leaf += 1) {
+        files.push({
+          path: `/vault/Proyectos/r${branch}/d${leaf}/ignore.txt`,
+          source: "ignored",
+        });
+      }
+    }
+    expect(16 + 16 * 32).toBeGreaterThan(TEST_MAX_SCAN_DIRECTORIES);
+    const fs = boundaryFs(memoryFs(files, ["/workspace/atlas"]));
+    const outcome = await resolveProjectWithCandidates({
+      cwd: "/workspace/atlas",
+      config: config(),
+      fs,
+      git: async () => ({ ok: true, stdout: "", stderr: "" }),
+    });
+    expect(outcome.resolution).toEqual({ kind: "unresolved", reason: "unreadable" });
+  });
+
+  it("rejects a deep tree instead of selecting a note from a partial scan", async () => {
+    const deep = Array.from({ length: TEST_MAX_SCAN_DEPTH + 2 }, (_, index) => `d${index}`).join("/");
+    const fs = boundaryFs(
+      memoryFs(
+        [
+          { path: "/vault/Proyectos/Atlas.md", source: "# Atlas\n" },
+          { path: `/vault/Proyectos/${deep}/Zed.txt`, source: "ignored" },
+        ],
+        ["/workspace/atlas"],
+      ),
+    );
+    const outcome = await resolveProjectWithCandidates({
+      cwd: "/workspace/atlas",
+      config: config(),
+      fs,
+      git: async () => ({ ok: true, stdout: "", stderr: "" }),
+    });
+    expect(outcome.resolution).toEqual({ kind: "unresolved", reason: "unreadable" });
+  });
+
+  it("derives a legacy exact title match from the matched value, not the filename", async () => {
+    const fs = boundaryFs(
+      memoryFs(
+        [{ path: "/vault/Proyectos/Report.md", source: "---\ntitle: Atlas\n---\n# Report\n" }],
+        ["/workspace/atlas"],
+      ),
+    );
+    const outcome = await resolveProjectWithCandidates({
+      cwd: "/workspace/atlas",
+      config: config(),
+      fs,
+      git: async () => ({ ok: true, stdout: "", stderr: "" }),
+    });
+    expect(outcome.resolution).toEqual({
+      kind: "resolved",
+      project_id: "Atlas",
+      basis: "exact_name",
+      note_path: "Proyectos/Report.md",
+    });
+  });
+
+  it("derives a legacy exact nested-directory match from the matched parent", async () => {
+    const fs = boundaryFs(
+      memoryFs(
+        [{ path: "/vault/Proyectos/Atlas/Status.md", source: "# Status\n" }],
+        ["/workspace/atlas"],
+      ),
+    );
+    const outcome = await resolveProjectWithCandidates({
+      cwd: "/workspace/atlas",
+      config: config(),
+      fs,
+      git: async () => ({ ok: true, stdout: "", stderr: "" }),
+    });
+    expect(outcome.resolution).toEqual({
+      kind: "resolved",
+      project_id: "Atlas",
+      basis: "exact_name",
+      note_path: "Proyectos/Atlas/Status.md",
+    });
+  });
+
+  it("derives a normalized legacy exact alias from the alias value", async () => {
+    const fs = boundaryFs(
+      memoryFs(
+        [{ path: "/vault/Proyectos/Report.md", source: "---\naliases: [Atlas Project]\n---\n# Report\n" }],
+        ["/workspace/Atlas Project"],
+      ),
+    );
+    const outcome = await resolveProjectWithCandidates({
+      cwd: "/workspace/Atlas Project",
+      config: config(),
+      fs,
+      git: async () => ({ ok: true, stdout: "", stderr: "" }),
+    });
+    expect(outcome.resolution).toEqual({
+      kind: "resolved",
+      project_id: "Atlas-Project",
+      basis: "exact_name",
+      note_path: "Proyectos/Report.md",
+    });
+  });
+
+  it("fails closed when the exact legacy matched value cannot become a safe id", async () => {
+    const fs = boundaryFs(
+      memoryFs(
+        [{ path: "/vault/Proyectos/Report.md", source: "---\naliases: [!!!]\n---\n# Report\n" }],
+        ["/workspace/!!!"],
+      ),
+    );
+    const outcome = await resolveProjectWithCandidates({
+      cwd: "/workspace/!!!",
+      config: config(),
+      fs,
+      git: async () => ({ ok: true, stdout: "", stderr: "" }),
+    });
+    expect(outcome.resolution).toEqual({ kind: "unresolved", reason: "unreadable" });
+  });
+});
 
 describe("exact public ProjectResolution seam", () => {
   it("returns the discriminated union directly", async () => {

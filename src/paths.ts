@@ -119,7 +119,12 @@ export interface ResolvedVaultPath {
   absolute: string;
 }
 
-/** Options for {@link VaultPaths.resolveRead}. */
+/** Result of validating an existing vault-relative directory. */
+export interface ResolvedVaultDirectory {
+  absolute: string;
+}
+
+/** Options for {@link VaultPaths.resolveRead} and directory scans. */
 export interface ReadOptions {
   /**
    * Automatic reads (bootstrap/search indexing) exclude the attachments
@@ -166,6 +171,43 @@ function lexicalSegments(
   }
   if (!input.endsWith(MARKDOWN_SUFFIX)) {
     throw new VaultPathError("not_markdown");
+  }
+  return segments;
+}
+
+/**
+ * Lexically validate a vault-relative directory path. Directory validation is
+ * intentionally separate from note validation: directories have no `.md`
+ * suffix, but retain the same relative/normalized/reserved-segment contract.
+ */
+function lexicalDirectorySegments(
+  input: unknown,
+  automatic: boolean,
+  attachmentsDir: string,
+): string[] {
+  if (typeof input !== "string" || input.length === 0) {
+    throw new VaultPathError("empty");
+  }
+  if (input.startsWith("/") || input.includes("\\")) {
+    throw new VaultPathError("not_relative");
+  }
+  if (input.length > 1024 || /[\u0000-\u001F\u007F]/.test(input)) {
+    throw new VaultPathError("malformed");
+  }
+  const segments = input.split("/");
+  for (const segment of segments) {
+    if (segment === "." || segment === "..") {
+      throw new VaultPathError("traversal");
+    }
+    if (segment === "") {
+      throw new VaultPathError("malformed");
+    }
+    if (RESERVED_SEGMENTS.has(segment)) {
+      throw new VaultPathError("reserved");
+    }
+  }
+  if (automatic && (input === attachmentsDir || input.startsWith(`${attachmentsDir}/`))) {
+    throw new VaultPathError("attachments_automatic");
   }
   return segments;
 }
@@ -272,6 +314,47 @@ export class VaultPaths {
 
   private isWithin(realPath: string, vaultReal: string): boolean {
     return realPath === vaultReal || realPath.startsWith(`${vaultReal}/`);
+  }
+
+  /**
+   * Validate an existing vault-relative directory immediately before a
+   * directory read. This is the directory counterpart to `resolveRead`: it
+   * re-establishes the config-trusted root identity, checks parent/target
+   * realpath containment, and requires the followed target to be a directory.
+   * The result is a validation snapshot, not an atomic authorization token.
+   */
+  async resolveDirectory(
+    input: string,
+    options: ReadOptions = {},
+  ): Promise<ResolvedVaultDirectory> {
+    const segments = lexicalDirectorySegments(
+      input,
+      options.automatic ?? false,
+      this.attachmentsDir,
+    );
+    const vaultReal = await this.verifiedVaultReal();
+    const absolute = path.join(this.vaultRoot, ...segments);
+
+    const parentAbs = path.dirname(absolute);
+    const parentReal = await this.realpathOrThrow(parentAbs, "target_missing");
+    if (!this.isWithin(parentReal, vaultReal)) {
+      throw new VaultPathError("symlink_escape");
+    }
+
+    const targetReal = await this.realpathOrThrow(absolute, "target_missing");
+    if (!this.isWithin(targetReal, vaultReal)) {
+      throw new VaultPathError("symlink_escape");
+    }
+
+    const linkStat = await this.lstatOrThrow(absolute, "target_missing");
+    if (!linkStat.isSymbolicLink() && !linkStat.isDirectory()) {
+      throw new VaultPathError("target_not_file");
+    }
+    const followStat = await this.statOrThrow(absolute, "target_missing");
+    if (!followStat.isDirectory()) {
+      throw new VaultPathError("target_not_file");
+    }
+    return { absolute };
   }
 
   /** Resolve a note for reading; the target must exist and stay contained. */

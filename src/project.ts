@@ -8,9 +8,11 @@
  * selected project.
  */
 import { execFile as nodeExecFile } from "node:child_process";
-import { readdir, readFile, realpath } from "node:fs/promises";
+import { lstat, opendir, readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import type { BridgeConfig } from "./config.js";
+import { VaultPaths, type VaultPathsFs } from "./paths.js";
+import { parseProjectResolution } from "./schemas.js";
 import {
   type NoteMetadata,
   type ParsedNote,
@@ -37,6 +39,12 @@ export const MAX_LEXICAL_CANDIDATES = 8;
 export const MAX_REMOTES = 32;
 /** Maximum project-note directory depth below the configured projects dir. */
 export const MAX_SCAN_DEPTH = 16;
+/** Maximum entries visited across the entire deterministic scan. */
+export const MAX_SCAN_ENTRIES = 4_096;
+/** Maximum directories visited across the entire deterministic scan. */
+export const MAX_SCAN_DIRECTORIES = 512;
+/** Maximum entries materialized from one directory by the scanner seam. */
+export const MAX_SCAN_ENTRIES_PER_DIRECTORY = 256;
 
 /** Stable metadata extracted from one supported remote spelling. */
 export interface NormalizedRemote {
@@ -56,17 +64,39 @@ export interface ProjectDirent {
 }
 
 /** Filesystem seam used by resolution; tests can supply a fully synthetic FS. */
-export interface ProjectFs {
+export interface ProjectFs extends VaultPathsFs {
   readFile(filePath: string): Promise<string>;
+  /** Return at most the bounded materialization budget plus no overflow. */
   readdir(filePath: string): Promise<ProjectDirent[]>;
-  realpath(filePath: string): Promise<string>;
 }
 
-/** Node adapter for {@link ProjectFs}; no vault path is captured globally. */
+/**
+ * Node adapter for {@link ProjectFs}; no vault path is captured globally.
+ * `opendir` keeps a hostile wide directory from being fully materialized
+ * before the scanner can enforce its per-directory budget.
+ */
+async function nodeProjectReaddir(filePath: string): Promise<ProjectDirent[]> {
+  const handle = await opendir(filePath);
+  const entries: ProjectDirent[] = [];
+  try {
+    for await (const entry of handle) {
+      if (entries.length >= MAX_SCAN_ENTRIES_PER_DIRECTORY) {
+        throw new Error("project directory exceeds bounded entry budget");
+      }
+      entries.push(entry);
+    }
+    return entries;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
 export const nodeProjectFs: ProjectFs = {
   readFile: (filePath) => readFile(filePath, "utf8"),
-  readdir: (filePath) => readdir(filePath, { withFileTypes: true }),
+  readdir: nodeProjectReaddir,
   realpath,
+  stat: (filePath) => stat(filePath, { bigint: true }),
+  lstat: (filePath) => lstat(filePath, { bigint: true }),
 };
 
 /** Result returned by an injected Git runner. */
@@ -251,6 +281,16 @@ export async function resolveProjectWithCandidates(
 
   const notes = scanned.notes;
   const query = normalizeMatch(path.basename(trimTrailingSeparators(options.cwd)));
+  const override = await findExactOverrides(options.config, options.cwd, fs);
+  const overrideIds = uniqueByKey(override, (id) => id.normalize("NFC"));
+  if (overrideIds.length > 1) {
+    // Conflicting exact machine-local identities invalidate the request even
+    // when a higher tier happens to offer a match; never expose ambiguous([]).
+    return {
+      resolution: { kind: "unresolved", reason: "unreadable" },
+      lexical_candidates: [],
+    };
+  }
 
   // Tier 1: a normalized remote is the strongest identity signal.
   const remoteKeys = new Set(gitState.remotes.map((remote) => remoteKey(remote.repo)));
@@ -286,9 +326,7 @@ export async function resolveProjectWithCandidates(
   }
 
   // Tier 3: exact canonical local override. Prefixes never match.
-  const override = await findExactOverrides(options.config, options.cwd, fs);
   if (override.length > 0) {
-    const overrideIds = uniqueByKey(override, (id) => normalizeMatch(id));
     if (overrideIds.length === 1) {
       const id = overrideIds[0]!;
       const idMatches = notes.filter(
@@ -309,24 +347,14 @@ export async function resolveProjectWithCandidates(
         },
         lexical_candidates: [],
       };
-    } else {
-      const overrideNotes = notes.filter(
-        (note) =>
-          note.projectId !== null &&
-          overrideIds.some((id) => normalizeMatch(id) === normalizeMatch(note.projectId ?? "")),
-      );
-      return {
-        resolution: ambiguous(overrideNotes),
-        lexical_candidates: [],
-      };
     }
   }
 
   // Tier 4: exact directory, title, filename, or legacy note alias.
   const exactMatches = notes.filter((note) =>
-    note.exactNames.some((name) => normalizeMatch(name) === query),
+    note.exactNames.some((name) => normalizeMatch(name.value) === query),
   );
-  const exactSelection = selectNotes(exactMatches, "exact_name");
+  const exactSelection = selectExactNotes(exactMatches, query);
   if (exactSelection) {
     return { resolution: exactSelection, lexical_candidates: [] };
   }
@@ -359,35 +387,133 @@ export const resolveProjectIdentity = resolveProject;
 
 /** Build pure association data for unresolved/ambiguous resolution; never writes. */
 export function buildAssociationProposal(
-  outcome: ProjectResolutionOutcome | ProjectResolution,
-  createdAt: IsoTimestamp,
+  outcome: unknown,
+  createdAt: unknown,
   lexicalCandidates: readonly VaultPath[] = [],
 ): AssociationProposal | null {
-  const resolution = "resolution" in outcome ? outcome.resolution : outcome;
-  if (resolution.kind === "resolved") return null;
-  const sourceCandidates =
-    resolution.kind === "ambiguous"
-      ? resolution.candidates
-      : "resolution" in outcome
-        ? outcome.lexical_candidates.map((candidate) => candidate.path)
-        : lexicalCandidates;
-  const deduped = uniqueByKey(
-    sourceCandidates.filter(isVaultRelativeMarkdownPath),
+  try {
+    if (!isIsoUtcTimestamp(createdAt)) return null;
+    if (!Array.isArray(lexicalCandidates) || lexicalCandidates.length > MAX_LEXICAL_CANDIDATES) {
+      return null;
+    }
+
+    let rawResolution: unknown = outcome;
+    let wrapperCandidates: readonly unknown[] | null = null;
+    if (isRecord(outcome) && Object.prototype.hasOwnProperty.call(outcome, "resolution")) {
+      rawResolution = outcome.resolution;
+      const rawCandidates = outcome.lexical_candidates;
+      if (!Array.isArray(rawCandidates) || rawCandidates.length > MAX_LEXICAL_CANDIDATES) {
+        return null;
+      }
+      wrapperCandidates = rawCandidates;
+    }
+
+    const narrowed = narrowProposalResolution(rawResolution);
+    if (narrowed === null || narrowed.kind === "resolved") return null;
+
+    const sourceCandidates =
+      narrowed.kind === "ambiguous"
+        ? narrowed.candidates
+        : wrapperCandidates === null
+          ? lexicalCandidates
+          : wrapperCandidates.flatMap((candidate) => {
+              if (!isRecord(candidate) || typeof candidate.path !== "string") return [];
+              return [candidate.path];
+            });
+    if (sourceCandidates.length > MAX_LEXICAL_CANDIDATES) return null;
+    const deduped = sanitizeProposalCandidates(sourceCandidates);
+    const safeResolution: Exclude<ProjectResolution, { kind: "resolved" }> =
+      narrowed.kind === "ambiguous"
+        ? { kind: "ambiguous", candidates: deduped }
+        : { kind: "unresolved", reason: narrowed.reason };
+    return {
+      version: 1,
+      kind: "association",
+      resolution: safeResolution,
+      candidates: deduped,
+      daily_write_only: true,
+      created_at: createdAt,
+    };
+  } catch {
+    // This is a runtime boundary: getters, proxies, and malformed JS-shaped
+    // payloads are all rejected without copying attacker-controlled values.
+    return null;
+  }
+}
+
+function narrowProposalResolution(
+  value: unknown,
+): ProjectResolution | null {
+  if (!isRecord(value) || typeof value.kind !== "string") return null;
+  if (value.kind === "resolved") {
+    // Even though resolved proposals are never emitted, validate the full
+    // shared union before rejecting it so malformed resolved payloads cannot
+    // influence control flow.
+    try {
+      return parseProjectResolution(value);
+    } catch {
+      return null;
+    }
+  }
+  if (value.kind === "unresolved") {
+    if (!hasExactKeys(value, ["kind", "reason"]) || !isUnresolvedReason(value.reason)) {
+      return null;
+    }
+    try {
+      return parseProjectResolution({ kind: "unresolved", reason: value.reason });
+    } catch {
+      return null;
+    }
+  }
+  if (value.kind === "ambiguous") {
+    if (!hasExactKeys(value, ["kind", "candidates"]) || !Array.isArray(value.candidates)) {
+      return null;
+    }
+    if (value.candidates.length > MAX_LEXICAL_CANDIDATES) return null;
+    const candidates = sanitizeProposalCandidates(value.candidates);
+    try {
+      return parseProjectResolution({ kind: "ambiguous", candidates });
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function isUnresolvedReason(value: unknown): value is "no_git" | "no_match" | "unreadable" {
+  return value === "no_git" || value === "no_match" || value === "unreadable";
+}
+
+function sanitizeProposalCandidates(values: readonly unknown[]): VaultPath[] {
+  return uniqueByKey(
+    values.filter((value): value is string =>
+      typeof value === "string" && isVaultRelativeMarkdownPath(value),
+    ),
     (candidate) => normalizePathKey(candidate),
   ).sort(stableCompare) as VaultPath[];
-  const safeResolution: Exclude<ProjectResolution, { kind: "resolved" }> =
-    resolution.kind === "ambiguous"
-      ? { kind: "ambiguous", candidates: deduped }
-      : { kind: "unresolved", reason: resolution.reason };
-  return {
-    version: 1,
-    kind: "association",
-    resolution: safeResolution,
-    candidates: deduped,
-    daily_write_only: true,
-    created_at: createdAt,
-  };
 }
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactKeys(record: Record<string, unknown>, expected: string[]): boolean {
+  const actual = Object.keys(record).sort(stableCompare);
+  const sortedExpected = [...expected].sort(stableCompare);
+  return actual.length === sortedExpected.length && actual.every((key, index) => key === sortedExpected[index]);
+}
+
+/** Strict real ISO-8601 UTC timestamp check, canonicalized through Date. */
+function isIsoUtcTimestamp(value: unknown): value is IsoTimestamp {
+  if (typeof value !== "string") return false;
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,3}))?Z$/.exec(value);
+  if (!match) return false;
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return false;
+  const fraction = (match[2] ?? "").padEnd(3, "0");
+  return date.toISOString() === `${match[1]}.${fraction}Z`;
+}
+
 
 interface RemoteParts {
   host: string;
@@ -456,14 +582,26 @@ function remoteKey(value: string): string {
   return value.normalize("NFC").toLowerCase();
 }
 
+interface ExactName {
+  value: string;
+  /** Legacy id derived from this exact matched value, or null if unsafe. */
+  projectId: ProjectId | null;
+}
+
 interface ScannedProjectNote {
   path: VaultPath;
   portableId: ProjectId | null;
+  /** Portable id, otherwise a safe filename fallback for non-exact tiers. */
   projectId: ProjectId | null;
   portableAliases: string[];
   repositories: string[];
-  exactNames: string[];
+  exactNames: ExactName[];
   lexicalNames: string[];
+}
+
+interface ScanBudget {
+  entries: number;
+  directories: number;
 }
 
 async function inspectGit(
@@ -497,11 +635,25 @@ async function scanProjectNotes(
   config: BridgeConfig,
   fs: ProjectFs,
 ): Promise<{ kind: "ok"; notes: ScannedProjectNote[] } | { kind: "unreadable" }> {
-  const root = path.resolve(config.vault_path, ...config.layout.projects_dir.split("/"));
-  const seen = new Set<string>();
+  const vaultPaths = new VaultPaths(config.vault_path, {
+    identity: config.vault_identity,
+    attachmentsDir: config.layout.attachments_dir,
+    fs,
+  });
   const notes: ScannedProjectNote[] = [];
+  const seen = new Set<string>();
+  const budget: ScanBudget = { entries: 0, directories: 0 };
   try {
-    await walkProjectDirectory(root, 0, config.vault_path, fs, seen, notes);
+    await walkProjectDirectory(
+      config.layout.projects_dir,
+      0,
+      config.vault_path,
+      fs,
+      vaultPaths,
+      seen,
+      notes,
+      budget,
+    );
   } catch {
     return { kind: "unreadable" };
   }
@@ -509,33 +661,91 @@ async function scanProjectNotes(
 }
 
 async function walkProjectDirectory(
-  directory: string,
+  relativeDirectory: string,
   depth: number,
   vaultRoot: string,
   fs: ProjectFs,
+  vaultPaths: VaultPaths,
   seen: Set<string>,
   notes: ScannedProjectNote[],
+  budget: ScanBudget,
 ): Promise<void> {
-  if (depth > MAX_SCAN_DEPTH || notes.length >= MAX_PROJECT_NOTES) return;
-  const entries = await fs.readdir(directory);
+  if (depth > MAX_SCAN_DEPTH) {
+    throw new Error("project scan depth exceeded");
+  }
+  budget.directories += 1;
+  if (budget.directories > MAX_SCAN_DIRECTORIES) {
+    throw new Error("project scan directory budget exceeded");
+  }
+
+  // This validation is deliberately the closest possible precondition to the
+  // directory read. It re-establishes config.vault_identity and containment;
+  // the returned path remains only a validation snapshot per Task 2.
+  const validatedDirectory = await vaultPaths.resolveDirectory(relativeDirectory, {
+    automatic: true,
+  });
+  const entries = await fs.readdir(validatedDirectory.absolute);
+  if (entries.length > MAX_SCAN_ENTRIES_PER_DIRECTORY) {
+    throw new Error("project directory materialization budget exceeded");
+  }
+  budget.entries += entries.length;
+  if (budget.entries > MAX_SCAN_ENTRIES) {
+    throw new Error("project scan entry budget exceeded");
+  }
+  // A revalidation after readdir catches root/directory replacement before any
+  // returned entry can influence selection. It does not claim atomicity.
+  await vaultPaths.resolveDirectory(relativeDirectory, { automatic: true });
+
   entries.sort((left, right) => stableCompare(left.name, right.name));
   for (const entry of entries) {
-    if (notes.length >= MAX_PROJECT_NOTES) return;
-    if (entry.name.length === 0 || entry.name === "." || entry.name === "..") continue;
-    if (entry.isSymbolicLink()) continue;
-    const absolute = path.join(directory, entry.name);
-    if (entry.isDirectory()) {
-      await walkProjectDirectory(absolute, depth + 1, vaultRoot, fs, seen, notes);
+    if (!isSafeDirectoryEntryName(entry.name)) {
+      throw new Error("project directory entry name is malformed");
+    }
+    const isSymbolicLink = entry.isSymbolicLink();
+    const isDirectory = entry.isDirectory();
+    if (isSymbolicLink && isDirectory) {
+      // Never follow a directory symlink from the lexical Dirent listing.
+      // A symlinked Markdown target is still sent through resolveRead below so
+      // an escaping target fails closed at the closest read boundary.
       continue;
     }
-    if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
+    const absolute = path.join(validatedDirectory.absolute, entry.name);
+    if (isDirectory) {
+      await walkProjectDirectory(
+        `${relativeDirectory}/${entry.name}`,
+        depth + 1,
+        vaultRoot,
+        fs,
+        vaultPaths,
+        seen,
+        notes,
+        budget,
+      );
+      continue;
+    }
+    if (!entry.name.endsWith(".md")) continue;
+    if (notes.length >= MAX_PROJECT_NOTES) {
+      throw new Error("project note budget exceeded");
+    }
     const relative = toVaultRelative(vaultRoot, absolute);
-    if (!relative || seen.has(normalizePathKey(relative))) continue;
-    seen.add(normalizePathKey(relative));
-    const source = await fs.readFile(absolute);
-    if (Buffer.byteLength(source, "utf8") > MAX_NOTE_BYTES) continue;
-    const note = parseProjectNote(source, relative, absolute);
-    if (note) notes.push(note);
+    if (!relative) {
+      throw new Error("project note path is outside the vault");
+    }
+    const key = normalizePathKey(relative);
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    // Resolve the exact note path immediately before readFile. VaultPaths
+    // rechecks root identity, parent/target realpaths, lstat and followed stat
+    // with fixed redacted errors; this is a validation snapshot, not an
+    // impossible atomic authorization claim.
+    const validatedNote = await vaultPaths.resolveRead(relative, { automatic: true });
+    const source = await fs.readFile(validatedNote.absolute);
+    if (typeof source !== "string" || Buffer.byteLength(source, "utf8") > MAX_NOTE_BYTES) {
+      throw new Error("project note exceeds bounded size");
+    }
+    const note = parseProjectNote(source, relative, validatedNote.absolute);
+    notes.push(note);
   }
 }
 
@@ -543,53 +753,79 @@ function parseProjectNote(
   source: string,
   relative: VaultPath,
   absolute: string,
-): ScannedProjectNote | null {
-  try {
-    const parsed: ParsedNote = parseNote(source);
-    const metadata = parsed.frontmatter.kind === "present"
-      ? parsed.frontmatter.metadata
-      : emptyMetadata();
-    const portable = metadata.resyst_project;
-    const portableId = portable ? (portable.id as ProjectId) : null;
-    const projectId = portableId ?? deriveProjectId(path.basename(relative, ".md"));
-    const parent = path.basename(path.dirname(absolute));
-    const filename = path.basename(relative, ".md");
-    const firstH1 = parsed.headings.find((heading) => heading.level === 1)?.text ?? null;
-    const exactNames = uniqueStrings([
-      parent,
-      filename,
-      metadata.title ?? "",
-      firstH1 ?? "",
-      ...metadata.aliases,
-    ]);
-    const repositories = uniqueStrings(
-      (portable?.repos ?? [])
-        .map((repo) => normalizeRemote(repo))
-        .filter((repo): repo is NormalizedRemote => repo !== null)
-        .map((repo) => remoteKey(repo.repo)),
-    );
-    return {
-      path: relative,
-      portableId,
-      projectId,
-      portableAliases: portable?.aliases ?? [],
-      repositories,
-      exactNames,
-      lexicalNames: uniqueStrings([
-        ...exactNames,
-        portable?.id ?? "",
-        ...(portable?.aliases ?? []),
-        ...(portable?.repos ?? []),
-      ]),
-    };
-  } catch {
-    // A malformed/unreadable note is handled by the caller's bounded scan.
-    return null;
+): ScannedProjectNote {
+  const parsed: ParsedNote = parseNote(source);
+  if (parsed.frontmatter.kind === "invalid") {
+    // A delimited but invalid YAML block is not legacy/missing frontmatter.
+    throw new Error("project note frontmatter is invalid");
   }
+  const metadata = parsed.frontmatter.kind === "present"
+    ? parsed.frontmatter.metadata
+    : emptyMetadata();
+  const portable = metadata.resyst_project;
+  const portableId = portable ? (portable.id as ProjectId) : null;
+  const projectId = portableId ?? deriveLegacyProjectId(path.basename(relative, ".md"));
+  const parent = path.basename(path.dirname(absolute));
+  const filename = path.basename(relative, ".md");
+  const firstH1 = parsed.headings.find((heading) => heading.level === 1)?.text ?? null;
+  const exactValues = [
+    parent,
+    filename,
+    metadata.title ?? "",
+    firstH1 ?? "",
+    ...metadata.aliases,
+  ];
+  const exactNames = uniqueExactNames(exactValues);
+  const repositories = uniqueStrings(
+    (portable?.repos ?? [])
+      .map((repo) => normalizeRemote(repo))
+      .filter((repo): repo is NormalizedRemote => repo !== null)
+      .map((repo) => remoteKey(repo.repo)),
+  );
+  return {
+    path: relative,
+    portableId,
+    projectId,
+    portableAliases: portable?.aliases ?? [],
+    repositories,
+    exactNames,
+    lexicalNames: uniqueStrings([
+      ...exactNames.map((name) => name.value),
+      portable?.id ?? "",
+      ...(portable?.aliases ?? []),
+      ...(portable?.repos ?? []),
+    ]),
+  };
 }
 
 function emptyMetadata(): NoteMetadata {
   return { title: null, date: null, tags: [], aliases: [], resyst_project: null };
+}
+
+function uniqueExactNames(values: string[]): ExactName[] {
+  const out: ExactName[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    if (typeof value !== "string" || value.length === 0) continue;
+    const key = normalizeMatch(value);
+    if (key.length === 0 || seen.has(key)) continue;
+    seen.add(key);
+    out.push({ value, projectId: deriveLegacyProjectId(value) });
+  }
+  return out;
+}
+
+function isSafeDirectoryEntryName(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value !== "." &&
+    value !== ".." &&
+    value.length <= 1024 &&
+    !value.includes("/") &&
+    !value.includes("\\") &&
+    !/[\u0000-\u001F\u007F]/.test(value)
+  );
 }
 
 function selectNotes(
@@ -607,6 +843,50 @@ function selectNotes(
     kind: "resolved",
     project_id: note.projectId,
     basis,
+    note_path: note.path,
+  };
+}
+
+function selectExactNotes(
+  notes: ScannedProjectNote[],
+  query: string,
+): ProjectResolution | null {
+  const unique = dedupeNotes(notes);
+  if (unique.length === 0) return null;
+  if (unique.length > 1) return ambiguous(unique);
+  const note = unique[0]!;
+
+  // A portable id remains authoritative even when a legacy exact name also
+  // matches this note.
+  if (note.portableId !== null) {
+    return {
+      kind: "resolved",
+      project_id: note.portableId,
+      basis: "exact_name",
+      note_path: note.path,
+    };
+  }
+
+  const matched = note.exactNames.filter(
+    (name) => normalizeMatch(name.value) === query,
+  );
+  if (matched.length === 0) return null;
+  if (matched.some((name) => name.projectId === null)) {
+    return { kind: "unresolved", reason: "unreadable" };
+  }
+  const ids = uniqueByKey(
+    matched.map((name) => name.projectId!),
+    (id) => id.normalize("NFC"),
+  );
+  if (ids.length !== 1) {
+    // The public union has no source provenance field. Preserve deterministic
+    // ambiguity rather than selecting one conflicting metadata value.
+    return ambiguous([note]);
+  }
+  return {
+    kind: "resolved",
+    project_id: ids[0]!,
+    basis: "exact_name",
     note_path: note.path,
   };
 }
@@ -676,6 +956,22 @@ function rankLexicalCandidates(
     .sort((left, right) => left.score - right.score || stableCompare(left.note.path, right.note.path))
     .slice(0, MAX_LEXICAL_CANDIDATES)
     .map((item) => item.note);
+}
+
+/** Derive a legacy id only from a safe metadata/name value. */
+function deriveLegacyProjectId(value: string): ProjectId | null {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 1024 ||
+    value.trim().length === 0 ||
+    value.includes("/") ||
+    value.includes("\\") ||
+    /[\u0000-\u001F\u007F]/.test(value)
+  ) {
+    return null;
+  }
+  return deriveProjectId(value);
 }
 
 function deriveProjectId(stem: string): ProjectId | null {
