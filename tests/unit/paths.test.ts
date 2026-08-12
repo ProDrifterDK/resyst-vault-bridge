@@ -8,6 +8,7 @@
  * containment checks run for existing parents and targets.
  */
 import { describe, expect, expectTypeOf, it } from "vitest";
+import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -16,6 +17,7 @@ import {
   VaultPathError,
   VaultPaths,
   type ResolvedVaultPath,
+  type VaultPathsFs,
 } from "../../src/paths.js";
 import type { VaultPath } from "../../src/types.js";
 import { createVault, type CreatedVault } from "../fixtures/create-vault.js";
@@ -61,6 +63,61 @@ async function capture(
     expect(error).toBeInstanceOf(VaultPathError);
     return error as VaultPathError;
   }
+}
+
+/** Build a Node-style error with a stable `code`, echoing only a fake path. */
+function nodeError(code: string, filePath: string): NodeJS.ErrnoException {
+  const error = new Error(`${code}: ${filePath}`) as NodeJS.ErrnoException;
+  error.code = code;
+  return error;
+}
+
+/** Wrap the node paths seam, failing calls that match `failWhen`. */
+function failingPathsFs(
+  failWhen: (method: "realpath" | "stat" | "lstat", filePath: string) => boolean,
+  code: string,
+): VaultPathsFs {
+  return {
+    realpath: async (filePath) => {
+      if (failWhen("realpath", filePath)) throw nodeError(code, filePath);
+      return nodeVaultPathsFs.realpath(filePath);
+    },
+    stat: async (filePath) => {
+      if (failWhen("stat", filePath)) throw nodeError(code, filePath);
+      return nodeVaultPathsFs.stat(filePath);
+    },
+    lstat: async (filePath) => {
+      if (failWhen("lstat", filePath)) throw nodeError(code, filePath);
+      return nodeVaultPathsFs.lstat(filePath);
+    },
+  };
+}
+
+/** Track calls and report the write target as a non-regular file. */
+function nonRegularTargetFs(
+  targetAbs: string,
+): { fs: VaultPathsFs; realpathCalls: string[] } {
+  const realpathCalls: string[] = [];
+  return {
+    realpathCalls,
+    fs: {
+      realpath: async (filePath) => {
+        realpathCalls.push(filePath);
+        return nodeVaultPathsFs.realpath(filePath);
+      },
+      stat: async (filePath) => nodeVaultPathsFs.stat(filePath),
+      lstat: async (filePath) => {
+        if (filePath === targetAbs) {
+          return {
+            isFile: () => false,
+            isDirectory: () => false,
+            isSymbolicLink: () => false,
+          };
+        }
+        return nodeVaultPathsFs.lstat(filePath);
+      },
+    },
+  };
 }
 
 describe("VaultPaths: accepted normalized Markdown paths", () => {
@@ -369,6 +426,156 @@ describe("VaultPaths: error redaction and fixed messages", () => {
       const b = await capture(() => ctx.paths.resolveRead("../../x.md"));
       expect(a?.message).toBe(b?.message);
       expect(a?.message).toMatch(/^vault path /);
+    });
+  });
+});
+
+describe("VaultPaths: filesystem failures are redacted", () => {
+  const ioCodes = ["EACCES", "EIO"] as const;
+
+  for (const code of ioCodes) {
+    it(`maps ${code} on the vault root realpath to io_error for reads and writes`, async () => {
+      await withPaths(async (ctx) => {
+        const fs = failingPathsFs(
+          (method, filePath) => method === "realpath" && filePath === ctx.vault.vaultPath,
+          code,
+        );
+        const paths = new VaultPaths(ctx.vault.vaultPath, { fs });
+        const readErr = await capture(() => paths.resolveRead("CLAUDE.md"));
+        expect(readErr, code).toBeDefined();
+        expect(readErr?.code, code).toBe("io_error");
+        const writeErr = await capture(() => paths.resolveWrite("CLAUDE.md"));
+        expect(writeErr, code).toBeDefined();
+        expect(writeErr?.code, code).toBe("io_error");
+      });
+    });
+
+    it(`maps ${code} at every read seam to io_error`, async () => {
+      await withPaths(async (ctx) => {
+        await ctx.vault.writeNote("Proyectos/Atlas.md", "# Atlas\n");
+        const seams: Array<{
+          label: string;
+          failWhen: (method: "realpath" | "stat" | "lstat", filePath: string) => boolean;
+        }> = [
+          {
+            label: "parent realpath",
+            failWhen: (m, f) => m === "realpath" && f === ctx.vault.absolute("Proyectos"),
+          },
+          {
+            label: "target realpath",
+            failWhen: (m, f) => m === "realpath" && f === ctx.vault.absolute("Proyectos/Atlas.md"),
+          },
+          {
+            label: "target lstat",
+            failWhen: (m, f) => m === "lstat" && f === ctx.vault.absolute("Proyectos/Atlas.md"),
+          },
+          {
+            label: "target stat",
+            failWhen: (m, f) => m === "stat" && f === ctx.vault.absolute("Proyectos/Atlas.md"),
+          },
+        ];
+        for (const seam of seams) {
+          const fs = failingPathsFs(seam.failWhen, code);
+          const paths = new VaultPaths(ctx.vault.vaultPath, { fs });
+          const err = await capture(() => paths.resolveRead("Proyectos/Atlas.md"));
+          expect(err, `${code}:${seam.label}`).toBeDefined();
+          expect(err?.code, `${code}:${seam.label}`).toBe("io_error");
+          expect(err?.message, `${code}:${seam.label}`).not.toContain(ctx.vault.vaultPath);
+        }
+      });
+    });
+
+    it(`maps ${code} at every write seam to io_error`, async () => {
+      await withPaths(async (ctx) => {
+        const seams: Array<{
+          label: string;
+          target: string;
+          failWhen: (method: "realpath" | "stat" | "lstat", filePath: string) => boolean;
+        }> = [
+          {
+            label: "parent realpath",
+            target: "Proyectos/New.md",
+            failWhen: (m, f) => m === "realpath" && f === ctx.vault.absolute("Proyectos"),
+          },
+          {
+            label: "parent stat",
+            target: "Proyectos/New.md",
+            failWhen: (m, f) => m === "stat" && f === ctx.vault.absolute("Proyectos"),
+          },
+          {
+            label: "target lstat",
+            target: "CLAUDE.md",
+            failWhen: (m, f) => m === "lstat" && f === ctx.vault.absolute("CLAUDE.md"),
+          },
+          {
+            label: "target realpath",
+            target: "CLAUDE.md",
+            failWhen: (m, f) => m === "realpath" && f === ctx.vault.absolute("CLAUDE.md"),
+          },
+        ];
+        for (const seam of seams) {
+          const fs = failingPathsFs(seam.failWhen, code);
+          const paths = new VaultPaths(ctx.vault.vaultPath, { fs });
+          const err = await capture(() => paths.resolveWrite(seam.target));
+          expect(err, `${code}:${seam.label}`).toBeDefined();
+          expect(err?.code, `${code}:${seam.label}`).toBe("io_error");
+          expect(err?.message, `${code}:${seam.label}`).not.toContain(ctx.vault.vaultPath);
+        }
+      });
+    });
+  }
+
+  it("never leaks raw filesystem paths in io_error serialization", async () => {
+    await withPaths(async (ctx) => {
+      const fs = failingPathsFs(
+        (method, filePath) => method === "lstat" && filePath === ctx.vault.absolute("CLAUDE.md"),
+        "EACCES",
+      );
+      const paths = new VaultPaths(ctx.vault.vaultPath, { fs });
+      const err = await capture(() => paths.resolveRead("CLAUDE.md"));
+      expect(err).toBeDefined();
+      expect(JSON.stringify(err)).not.toContain(ctx.vault.vaultPath);
+      expect(JSON.stringify(err)).not.toContain("CLAUDE.md");
+      expect(JSON.stringify(err)).not.toContain("EACCES");
+    });
+  });
+});
+
+describe("VaultPaths: non-regular write targets", () => {
+  it("rejects a FIFO/socket-shaped write target with target_not_file before realpath", async () => {
+    await withPaths(async (ctx) => {
+      const targetAbs = ctx.vault.absolute("Proyectos/pipe.md");
+      const { fs, realpathCalls } = nonRegularTargetFs(targetAbs);
+      const paths = new VaultPaths(ctx.vault.vaultPath, { fs });
+      const err = await capture(() => paths.resolveWrite("Proyectos/pipe.md"));
+      expect(err).toBeDefined();
+      expect(err?.code).toBe("target_not_file");
+      expect(realpathCalls).not.toContain(targetAbs);
+      expect(realpathCalls).not.toContain(ctx.vault.absolute("Proyectos/pipe.md"));
+    });
+  });
+
+  it("rejects an existing FIFO write target with target_not_file", async () => {
+    await withPaths(async (ctx) => {
+      const fifoAbs = ctx.vault.absolute("pipe.md");
+      try {
+        execFileSync("mkfifo", [fifoAbs]);
+      } catch {
+        return; // mkfifo unavailable: the injected-seam test above covers the rule.
+      }
+      const err = await capture(() => ctx.paths.resolveWrite("pipe.md"));
+      expect(err).toBeDefined();
+      expect(err?.code).toBe("target_not_file");
+      const readErr = await capture(() => ctx.paths.resolveRead("pipe.md"));
+      expect(readErr).toBeDefined();
+      expect(readErr?.code).toBe("target_not_file");
+    });
+  });
+
+  it("still accepts a write to an existing regular file", async () => {
+    await withPaths(async (ctx) => {
+      const resolved = await ctx.paths.resolveWrite("CLAUDE.md");
+      expect(resolved.absolute).toBe(ctx.vault.paths.claudeMd);
     });
   });
 });

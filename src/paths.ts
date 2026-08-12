@@ -17,7 +17,12 @@
  *    require an existing directory parent and a non-directory target.
  *
  * Errors are {@link VaultPathError}s with stable codes and fixed, redacted
- * messages that never echo the offending path or the vault location.
+ * messages that never echo the offending path or the vault location. Only
+ * `ENOENT` maps to absence; every other filesystem failure at the public
+ * boundary maps to `io_error`. A successful resolve is a validation snapshot,
+ * not an authorization token: callers must revalidate path/hash/structure at
+ * the final I/O seam (the Task 8 transaction service does this under the
+ * local lock).
  */
 import { lstat, realpath, stat } from "node:fs/promises";
 import path from "node:path";
@@ -44,7 +49,8 @@ export type VaultPathErrorCode =
   | "target_not_file"
   | "target_is_directory"
   | "parent_missing"
-  | "parent_not_directory";
+  | "parent_not_directory"
+  | "io_error";
 
 /** Fixed, redacted messages keyed by {@link VaultPathErrorCode}. */
 const VAULT_PATH_ERROR_MESSAGES: Record<VaultPathErrorCode, string> = {
@@ -62,6 +68,7 @@ const VAULT_PATH_ERROR_MESSAGES: Record<VaultPathErrorCode, string> = {
   target_is_directory: "vault path is a directory",
   parent_missing: "vault path parent does not exist",
   parent_not_directory: "vault path parent is not a directory",
+  io_error: "vault path failed with an io error",
 };
 
 /** Fixed, redacted error for a rejected vault path; never echoes values. */
@@ -91,7 +98,15 @@ export const nodeVaultPathsFs: VaultPathsFs = {
   lstat,
 };
 
-/** Result of a successful containment check: branded path plus absolute path. */
+/**
+ * Result of a successful containment check: branded path plus absolute path.
+ *
+ * This is a validation snapshot, not an authorization token: the filesystem
+ * can change between this check and the final I/O (symlink swap, target
+ * replacement), so callers must revalidate path/hash/structure at the final
+ * I/O seam. The transaction service (Task 8) performs that revalidation
+ * under the local lock before any write.
+ */
 export interface ResolvedVaultPath {
   vaultRelative: VaultPath;
   absolute: string;
@@ -171,7 +186,13 @@ export class VaultPaths {
 
   private async ensureVaultReal(): Promise<string> {
     if (this.vaultReal === undefined) {
-      this.vaultReal = await this.fs.realpath(this.vaultRoot);
+      try {
+        this.vaultReal = await this.fs.realpath(this.vaultRoot);
+      } catch {
+        // The containment root cannot be established; every failure (including
+        // a vanished root) is a fixed redacted io error, never a raw Node error.
+        throw new VaultPathError("io_error");
+      }
     }
     return this.vaultReal;
   }
@@ -196,24 +217,16 @@ export class VaultPaths {
       throw new VaultPathError("symlink_escape");
     }
 
-    let targetReal: string;
-    try {
-      targetReal = await this.fs.realpath(absolute);
-    } catch (error) {
-      if (errorIsCode(error, "ENOENT")) {
-        throw new VaultPathError("target_missing");
-      }
-      throw error;
-    }
+    const targetReal = await this.realpathOrThrow(absolute, "target_missing");
     if (!this.isWithin(targetReal, vaultReal)) {
       throw new VaultPathError("symlink_escape");
     }
 
-    const linkStat = await this.fs.lstat(absolute);
+    const linkStat = await this.lstatOrThrow(absolute, "target_missing");
     if (!linkStat.isSymbolicLink() && !linkStat.isFile()) {
       throw new VaultPathError("target_not_file");
     }
-    const followStat = await this.fs.stat(absolute);
+    const followStat = await this.statOrThrow(absolute, "target_missing");
     if (!followStat.isFile()) {
       throw new VaultPathError("target_not_file");
     }
@@ -233,13 +246,13 @@ export class VaultPaths {
       if (!this.isWithin(parentReal, vaultReal)) {
         throw new VaultPathError("symlink_escape");
       }
-      const parentStat = await this.fs.stat(parentAbs);
+      const parentStat = await this.statOrThrow(parentAbs, "parent_missing");
       if (!parentStat.isDirectory()) {
         throw new VaultPathError("parent_not_directory");
       }
     }
 
-    let linkStat: Awaited<ReturnType<VaultPathsFs["lstat"]>>;
+    let linkStat: LStatLike | null;
     try {
       linkStat = await this.fs.lstat(absolute);
     } catch (error) {
@@ -247,12 +260,12 @@ export class VaultPaths {
         // New file under a validated existing parent.
         return { vaultRelative: input as VaultPath, absolute };
       }
-      throw error;
+      throw new VaultPathError("io_error");
     }
     if (linkStat.isSymbolicLink()) {
       // A symlinked write target is rejected; escaping symlinks report the
       // more severe containment violation.
-      const targetReal = await this.fs.realpath(absolute);
+      const targetReal = await this.realpathOrThrow(absolute, "target_missing");
       if (!this.isWithin(targetReal, vaultReal)) {
         throw new VaultPathError("symlink_escape");
       }
@@ -261,7 +274,12 @@ export class VaultPaths {
     if (linkStat.isDirectory()) {
       throw new VaultPathError("target_is_directory");
     }
-    const targetReal = await this.fs.realpath(absolute);
+    if (!linkStat.isFile()) {
+      // FIFOs, sockets, devices, and other non-regular targets are rejected
+      // before any realpath or write can touch them.
+      throw new VaultPathError("target_not_file");
+    }
+    const targetReal = await this.realpathOrThrow(absolute, "target_missing");
     if (!this.isWithin(targetReal, vaultReal)) {
       throw new VaultPathError("symlink_escape");
     }
@@ -269,8 +287,9 @@ export class VaultPaths {
   }
 
   /**
-   * Resolve the real path of an existing path, mapping only ENOENT to the
-   * supplied absence code; every other failure propagates unchanged.
+   * Resolve the real path of an existing path. Only `ENOENT` maps to the
+   * supplied absence code; every other failure becomes the fixed redacted
+   * {@link VaultPathErrorCode.io_error} so no raw Node error or path leaks.
    */
   private async realpathOrThrow(
     filePath: string,
@@ -282,9 +301,50 @@ export class VaultPaths {
       if (errorIsCode(error, "ENOENT")) {
         throw new VaultPathError(absentCode);
       }
-      throw error;
+      throw new VaultPathError("io_error");
     }
   }
+
+  /** lstat wrapper with the same ENOENT/io_error mapping as realpath. */
+  private async lstatOrThrow(
+    filePath: string,
+    absentCode: "target_missing" | "parent_missing",
+  ): Promise<LStatLike> {
+    try {
+      return await this.fs.lstat(filePath);
+    } catch (error) {
+      if (errorIsCode(error, "ENOENT")) {
+        throw new VaultPathError(absentCode);
+      }
+      throw new VaultPathError("io_error");
+    }
+  }
+
+  /** stat wrapper with the same ENOENT/io_error mapping as realpath. */
+  private async statOrThrow(
+    filePath: string,
+    absentCode: "target_missing" | "parent_missing",
+  ): Promise<StatLike> {
+    try {
+      return await this.fs.stat(filePath);
+    } catch (error) {
+      if (errorIsCode(error, "ENOENT")) {
+        throw new VaultPathError(absentCode);
+      }
+      throw new VaultPathError("io_error");
+    }
+  }
+}
+
+/** Minimal directory/file shape shared by stat results. */
+interface StatLike {
+  isDirectory(): boolean;
+  isFile(): boolean;
+}
+
+/** lstat result shape that additionally distinguishes symlinks. */
+interface LStatLike extends StatLike {
+  isSymbolicLink(): boolean;
 }
 
 /** Narrow a thrown `unknown` to its Node error code, if any. */
