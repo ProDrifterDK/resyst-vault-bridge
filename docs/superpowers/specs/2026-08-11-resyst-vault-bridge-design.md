@@ -178,7 +178,7 @@ source:
   agent: prime-agent
   host_id: workstation
   session_id: opaque-session-id
-  cwd: /path/to/project
+  cwd: /home/tester/project
 project:
   id: prime-agent
 knowledge:

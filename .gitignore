@@ -7,3 +7,12 @@ coverage/
 *.log
 .DS_Store
 *.tsbuildinfo
+
+# Machine-local bridge state and vault mutation artifacts
+.resyst/
+resyst-vault/
+*.journal.jsonl
+*.receipt.json
+*.backup
+*.bak
+*.tmp

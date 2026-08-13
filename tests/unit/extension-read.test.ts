@@ -61,7 +61,7 @@ function capture(service: BridgeReadService): { tools: ToolDefinition[]; appendE
 }
 
 function fakeContext(): ExtensionContext {
-  return { cwd: "/synthetic/atlas" } as unknown as ExtensionContext;
+  return { cwd: "/home/tester/synthetic/atlas" } as unknown as ExtensionContext;
 }
 
 describe("Prime read tools", () => {

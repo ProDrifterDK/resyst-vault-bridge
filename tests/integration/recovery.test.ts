@@ -20,7 +20,7 @@ function checkpoint(): ApplyCheckpoint {
   return {
     version: 1,
     kind: "apply",
-    source: { agent: "prime-agent", host_id: "casey" as HostId, session_id: "session-atlas" as SessionId, cwd: "/synthetic/atlas" },
+    source: { agent: "prime-agent", host_id: "casey" as HostId, session_id: "session-atlas" as SessionId, cwd: "/home/tester/synthetic/atlas" },
     project: { id: "atlas" as ProjectId },
     knowledge: { completed_tasks: [{ text: "Finished Atlas recovery", evidence: ["test-1" as EvidenceId] }], decisions: [], status_changes: [], blockers: [], reusable_learnings: [], next_steps: [] },
     evidence: { commits: [], tests: [{ id: "test-1" as EvidenceId, value: "recovery integration" }], files: [], deployments: [], observations: [] },

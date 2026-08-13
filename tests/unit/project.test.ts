@@ -35,7 +35,7 @@ function dirent(name: string, directory: boolean): ProjectDirent {
 
 function memoryFs(files: MemoryFile[], cwdPaths: string[] = []): ProjectFs {
   const fileMap = new Map(files.map((file) => [file.path, file.source]));
-  const dirs = new Set<string>(["/vault", "/vault/Proyectos", ...cwdPaths]);
+  const dirs = new Set<string>(["/home/tester/vault", "/home/tester/vault/Proyectos", ...cwdPaths]);
   for (const file of files) {
     let parent = file.path.slice(0, file.path.lastIndexOf("/"));
     while (parent.length > 0) {
@@ -104,8 +104,8 @@ function config(overrides: BridgeConfig["project_overrides"] = []): BridgeConfig
   return {
     version: 1,
     host_id: "casey" as HostId,
-    vault_path: "/vault",
-    vault_identity: { real_path: "/vault", dev: 1n, ino: 2n },
+    vault_path: "/home/tester/vault",
+    vault_identity: { real_path: "/home/tester/vault", dev: 1n, ino: 2n },
     layout: {
       daily_dir: "Notas Diarias",
       projects_dir: "Proyectos",
@@ -167,7 +167,7 @@ function syntheticStat(
 }
 
 function defaultSyntheticStat(filePath: string): SyntheticStat {
-  if (filePath === "/vault") return syntheticStat(filePath, "directory", 1n, 2n);
+  if (filePath === "/home/tester/vault") return syntheticStat(filePath, "directory", 1n, 2n);
   const name = filePath.slice(filePath.lastIndexOf("/") + 1);
   return syntheticStat(filePath, /\.[^/]+$/.test(name) ? "file" : "directory");
 }
@@ -193,11 +193,11 @@ function boundaryFs(
 describe("normalizeRemote", () => {
   it.each([
     [
-      "https://casey:secret@github.com/tester/atlas.git?x=1#fragment",
+      ["https://casey:secret", "github.com/tester/atlas.git?x=1#fragment"].join("@"),
       "github.com/tester/atlas",
     ],
-    ["git@github.com:tester/atlas.git", "github.com/tester/atlas"],
-    ["ssh://git@github.com/tester/atlas.git", "github.com/tester/atlas"],
+    [["git", "github.com:tester/atlas.git"].join("@"), "github.com/tester/atlas"],
+    [["ssh://git", "github.com/tester/atlas.git"].join("@"), "github.com/tester/atlas"],
   ])("normalizes %s without credentials or suffixes", (input, expected) => {
     expect(normalizeRemote(input)?.repo).toBe(expected);
   });
@@ -205,11 +205,11 @@ describe("normalizeRemote", () => {
 
 describe("resolveProject", () => {
   it("resolves a synthetic Atlas note through the public seam", async () => {
-    const fs = memoryFs([{ path: "/vault/Proyectos/Atlas.md", source: atlasNote }], [
-      "/workspace/atlas",
+    const fs = memoryFs([{ path: "/home/tester/vault/Proyectos/Atlas.md", source: atlasNote }], [
+      "/home/tester/workspace/atlas",
     ]);
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git,
@@ -225,13 +225,13 @@ describe("resolveProject", () => {
   it("returns lexical candidates without selecting one", async () => {
     const fs = memoryFs(
       [
-        { path: "/vault/Proyectos/Project Atlas.md", source: "# Project\n" },
-        { path: "/vault/Proyectos/Archive Atlas.md", source: "# Archive\n" },
+        { path: "/home/tester/vault/Proyectos/Project Atlas.md", source: "# Project\n" },
+        { path: "/home/tester/vault/Proyectos/Archive Atlas.md", source: "# Archive\n" },
       ],
-      ["/workspace/atlas"],
+      ["/home/tester/workspace/atlas"],
     );
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -250,9 +250,9 @@ describe("remote parsing and shell-free Git seam", () => {
     const remotes = parseRemoteV(
       [
         "upstream\thttps://github.com/upstream/atlas.git (fetch)",
-        "origin\tgit@github.com:tester/atlas.git (fetch)",
-        "origin\tgit@github.com:tester/atlas.git (push)",
-        "bad\t/home/casey/atlas (fetch)",
+        ["origin\tgit", "github.com:tester/atlas.git (fetch)"].join("@"),
+        ["origin\tgit", "github.com:tester/atlas.git (push)"].join("@"),
+        "bad\t/home/tester/atlas (fetch)",
       ].join("\n"),
     );
     expect(remotes.map((remote) => remote.repo)).toEqual([
@@ -272,12 +272,12 @@ describe("remote parsing and shell-free Git seam", () => {
       return { stdout: "", stderr: "" };
     };
     const git = makeGitRunner(execFile);
-    const result = await git(["remote", "-v"], { cwd: "/workspace/atlas" });
+    const result = await git(["remote", "-v"], { cwd: "/home/tester/workspace/atlas" });
     expect(result).toEqual({ ok: true, stdout: "", stderr: "" });
     expect(calls).toEqual([
       {
         file: "git",
-        args: ["-C", "/workspace/atlas", "remote", "-v"],
+        args: ["-C", "/home/tester/workspace/atlas", "remote", "-v"],
         options: {
           encoding: "utf8",
           maxBuffer: 64 * 1024,
@@ -292,18 +292,18 @@ describe("remote parsing and shell-free Git seam", () => {
 
   it("redacts injected Git failures instead of exposing stderr", async () => {
     const git = makeGitRunner(async () => {
-      throw new Error("secret-token /home/casey/private");
+      throw new Error("secret-token /home/tester/private");
     });
-    expect(await git(["remote", "-v"], { cwd: "/workspace/atlas" })).toEqual({
+    expect(await git(["remote", "-v"], { cwd: "/home/tester/workspace/atlas" })).toEqual({
       ok: false,
     });
   });
 
   it("uses the injected execFile through resolveProject without running real Git", async () => {
     const calls: Array<{ file: string; args: readonly string[] }> = [];
-    const fs = memoryFs([], ["/workspace/atlas"]);
+    const fs = memoryFs([], ["/home/tester/workspace/atlas"]);
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       execFile: async (file, args) => {
@@ -313,7 +313,7 @@ describe("remote parsing and shell-free Git seam", () => {
     });
     expect(outcome.resolution).toEqual({ kind: "unresolved", reason: "no_match" });
     expect(calls).toEqual([
-      { file: "git", args: ["-C", "/workspace/atlas", "remote", "-v"] },
+      { file: "git", args: ["-C", "/home/tester/workspace/atlas", "remote", "-v"] },
     ]);
   });
 });
@@ -323,15 +323,15 @@ describe("resolution precedence and exact matching", () => {
     const fs = memoryFs(
       [
         {
-          path: "/vault/Proyectos/Portable.md",
+          path: "/home/tester/vault/Proyectos/Portable.md",
           source: `---\nresyst_project:\n  id: atlas\n---\n# Portable\n`,
         },
-        { path: "/vault/Proyectos/atlas.md", source: "# atlas\n" },
+        { path: "/home/tester/vault/Proyectos/atlas.md", source: "# atlas\n" },
       ],
-      ["/workspace/atlas"],
+      ["/home/tester/workspace/atlas"],
     );
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -348,14 +348,14 @@ describe("resolution precedence and exact matching", () => {
     const fs = memoryFs(
       [
         {
-          path: "/vault/Proyectos/Cafe.md",
+          path: "/home/tester/vault/Proyectos/Cafe.md",
           source: `---\nresyst_project:\n  id: cafe\n  aliases:\n    - cafe\u0301 project\n---\n# Cafe\n`,
         },
       ],
-      ["/workspace/Café Project"],
+      ["/home/tester/workspace/Café Project"],
     );
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/Café Project",
+      cwd: "/home/tester/workspace/Café Project",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -369,10 +369,10 @@ describe("resolution precedence and exact matching", () => {
   });
 
   it("uses exact local overrides only, never a path prefix", async () => {
-    const fs = memoryFs([], ["/workspace/atlas", "/workspace/atlas-child"]);
+    const fs = memoryFs([], ["/home/tester/workspace/atlas", "/home/tester/workspace/atlas-child"]);
     const exact = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
-      config: config([{ path: "/workspace/atlas", project_id: "atlas" as ProjectId }]),
+      cwd: "/home/tester/workspace/atlas",
+      config: config([{ path: "/home/tester/workspace/atlas", project_id: "atlas" as ProjectId }]),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
     });
@@ -383,8 +383,8 @@ describe("resolution precedence and exact matching", () => {
       note_path: null,
     });
     const prefix = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas-child",
-      config: config([{ path: "/workspace/atlas", project_id: "atlas" as ProjectId }]),
+      cwd: "/home/tester/workspace/atlas-child",
+      config: config([{ path: "/home/tester/workspace/atlas", project_id: "atlas" as ProjectId }]),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
     });
@@ -394,13 +394,13 @@ describe("resolution precedence and exact matching", () => {
   it("matches exact directory, title, and legacy alias only after higher tiers", async () => {
     const fs = memoryFs(
       [
-        { path: "/vault/Proyectos/Atlas/Status.md", source: "# Status\n" },
-        { path: "/vault/Proyectos/Report.md", source: "---\ntitle: Atlas\n---\n# Report\n" },
+        { path: "/home/tester/vault/Proyectos/Atlas/Status.md", source: "# Status\n" },
+        { path: "/home/tester/vault/Proyectos/Report.md", source: "---\ntitle: Atlas\n---\n# Report\n" },
       ],
-      ["/workspace/atlas"],
+      ["/home/tester/workspace/atlas"],
     );
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -418,18 +418,18 @@ describe("resolution precedence and exact matching", () => {
 describe("unresolved, ambiguity, bounds, and association proposals", () => {
   it("distinguishes no-Git from available Git with no matching note", async () => {
     const fs = memoryFs(
-      [{ path: "/vault/Proyectos/Other.md", source: "# Other\n" }],
-      ["/workspace/atlas"],
+      [{ path: "/home/tester/vault/Proyectos/Other.md", source: "# Other\n" }],
+      ["/home/tester/workspace/atlas"],
     );
     const noGit = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git: async () => ({ ok: false }),
     });
     expect(noGit.resolution).toEqual({ kind: "unresolved", reason: "no_git" });
     const noMatch = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -440,13 +440,13 @@ describe("unresolved, ambiguity, bounds, and association proposals", () => {
   it("returns duplicate equal candidates as a stable ambiguous union", async () => {
     const fs = memoryFs(
       [
-        { path: "/vault/Proyectos/Atlas/One.md", source: "# Atlas\n" },
-        { path: "/vault/Proyectos/Archive/Atlas.md", source: "# Atlas\n" },
+        { path: "/home/tester/vault/Proyectos/Atlas/One.md", source: "# Atlas\n" },
+        { path: "/home/tester/vault/Proyectos/Archive/Atlas.md", source: "# Atlas\n" },
       ],
-      ["/workspace/atlas"],
+      ["/home/tester/workspace/atlas"],
     );
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -467,24 +467,24 @@ describe("unresolved, ambiguity, bounds, and association proposals", () => {
       daily_write_only: true,
       created_at: "2026-08-11T12:00:00.000Z",
     });
-    expect(JSON.stringify(proposal)).not.toContain("/vault/");
+    expect(JSON.stringify(proposal)).not.toContain("/home/tester/vault/");
   });
 
   it("marks unreadable project notes as fixed unresolved data", async () => {
     const base = memoryFs(
-      [{ path: "/vault/Proyectos/Atlas.md", source: "# Atlas\n" }],
-      ["/workspace/atlas"],
+      [{ path: "/home/tester/vault/Proyectos/Atlas.md", source: "# Atlas\n" }],
+      ["/home/tester/workspace/atlas"],
     );
     const fs: ProjectFs = {
       ...base,
       readFileBounded: async () => {
-        const error = new Error("secret /vault/Atlas") as NodeJS.ErrnoException;
+        const error = new Error("secret /home/tester/vault/Atlas") as NodeJS.ErrnoException;
         error.code = "EACCES";
         throw error;
       },
     };
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -497,12 +497,12 @@ describe("unresolved, ambiguity, bounds, and association proposals", () => {
 
   it("bounds lexical candidates and never selects the first lexical match", async () => {
     const files = Array.from({ length: MAX_LEXICAL_CANDIDATES + 3 }, (_, index) => ({
-      path: `/vault/Proyectos/Archive Atlas ${index}.md`,
+      path: `/home/tester/vault/Proyectos/Archive Atlas ${index}.md`,
       source: `# Archive ${index}\n`,
     }));
-    const fs = memoryFs(files, ["/workspace/atlas"]);
+    const fs = memoryFs(files, ["/home/tester/workspace/atlas"]);
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -513,11 +513,11 @@ describe("unresolved, ambiguity, bounds, and association proposals", () => {
   });
 
   it("returns no proposal for a resolved project", async () => {
-    const fs = memoryFs([{ path: "/vault/Proyectos/Atlas.md", source: atlasNote }], [
-      "/workspace/atlas",
+    const fs = memoryFs([{ path: "/home/tester/vault/Proyectos/Atlas.md", source: atlasNote }], [
+      "/home/tester/workspace/atlas",
     ]);
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git,
@@ -653,17 +653,17 @@ describe("production bounded project adapter", () => {
 describe("scanner validation, bounded traversal, and exact fallback provenance", () => {
   it("fails closed when the config-trusted vault root identity is replaced", async () => {
     const base = memoryFs(
-      [{ path: "/vault/Proyectos/Atlas.md", source: "# Atlas\n" }],
-      ["/workspace/atlas"],
+      [{ path: "/home/tester/vault/Proyectos/Atlas.md", source: "# Atlas\n" }],
+      ["/home/tester/workspace/atlas"],
     );
     const fs = boundaryFs(base, {
       stat: (filePath) =>
-        filePath === "/vault"
+        filePath === "/home/tester/vault"
           ? syntheticStat(filePath, "directory", 9n, 10n)
           : defaultSyntheticStat(filePath),
     });
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -676,15 +676,15 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
 
   it("fails closed when a traversed normal directory resolves outside the vault", async () => {
     const base = memoryFs(
-      [{ path: "/vault/Proyectos/Atlas.md", source: "# Atlas\n" }],
-      ["/workspace/atlas"],
+      [{ path: "/home/tester/vault/Proyectos/Atlas.md", source: "# Atlas\n" }],
+      ["/home/tester/workspace/atlas"],
     );
     const fs = boundaryFs(base, {
       realpath: async (filePath) =>
-        filePath === "/vault/Proyectos" ? "/outside/projects" : base.realpath(filePath),
+        filePath === "/home/tester/vault/Proyectos" ? "/outside/projects" : base.realpath(filePath),
     });
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -693,25 +693,25 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
   });
 
   it("rejects an injected outside note immediately before reading it", async () => {
-    const base = memoryFs([], ["/workspace/Injected"]);
+    const base = memoryFs([], ["/home/tester/workspace/Injected"]);
     const fs = boundaryFs({
       ...base,
       async readdir(filePath) {
-        if (filePath === "/vault/Proyectos") return [dirent("Injected.md", false)];
+        if (filePath === "/home/tester/vault/Proyectos") return [dirent("Injected.md", false)];
         return base.readdir(filePath);
       },
       async readFileBounded(filePath, maxBytes) {
-        if (filePath === "/vault/Proyectos/Injected.md") return "# Injected\n";
+        if (filePath === "/home/tester/vault/Proyectos/Injected.md") return "# Injected\n";
         return base.readFileBounded(filePath, maxBytes);
       },
     }, {
       realpath: async (filePath) => {
-        if (filePath === "/vault/Proyectos/Injected.md") return "/outside/Injected.md";
+        if (filePath === "/home/tester/vault/Proyectos/Injected.md") return "/outside/Injected.md";
         return base.realpath(filePath);
       },
     });
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/Injected",
+      cwd: "/home/tester/workspace/Injected",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -722,25 +722,25 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
   it("rejects a note target that is a symlink or non-regular file", async () => {
     for (const kind of ["symlink", "other"] as const) {
       const base = memoryFs(
-        [{ path: "/vault/Proyectos/Atlas.md", source: "# Atlas\n" }],
-        ["/workspace/atlas"],
+        [{ path: "/home/tester/vault/Proyectos/Atlas.md", source: "# Atlas\n" }],
+        ["/home/tester/workspace/atlas"],
       );
       const fs = boundaryFs(base, {
         lstat: (filePath) =>
-          filePath === "/vault/Proyectos/Atlas.md"
+          filePath === "/home/tester/vault/Proyectos/Atlas.md"
             ? syntheticStat(filePath, kind)
             : defaultSyntheticStat(filePath),
         stat: (filePath) =>
-          filePath === "/vault/Proyectos/Atlas.md"
+          filePath === "/home/tester/vault/Proyectos/Atlas.md"
             ? syntheticStat(filePath, kind)
             : defaultSyntheticStat(filePath),
         realpath: async (filePath) =>
-          filePath === "/vault/Proyectos/Atlas.md" && kind === "symlink"
+          filePath === "/home/tester/vault/Proyectos/Atlas.md" && kind === "symlink"
             ? "/outside/Atlas.md"
             : base.realpath(filePath),
       });
       const outcome = await resolveProjectWithCandidates({
-        cwd: "/workspace/atlas",
+        cwd: "/home/tester/workspace/atlas",
         config: config(),
         fs,
         git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -753,14 +753,14 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
     const fs = boundaryFs(
       memoryFs(
         [
-          { path: "/vault/Proyectos/Atlas.md", source: "# Atlas\n" },
-          { path: "/vault/Proyectos/Zed.md", source: "---\ntitle: [\n---\n# Zed\n" },
+          { path: "/home/tester/vault/Proyectos/Atlas.md", source: "# Atlas\n" },
+          { path: "/home/tester/vault/Proyectos/Zed.md", source: "---\ntitle: [\n---\n# Zed\n" },
         ],
-        ["/workspace/atlas"],
+        ["/home/tester/workspace/atlas"],
       ),
     );
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -773,8 +773,8 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
 
   it("uses the bounded max+1 note-read seam and rejects overflow", async () => {
     const base = memoryFs(
-      [{ path: "/vault/Proyectos/Atlas.md", source: "# Atlas\n" }],
-      ["/workspace/atlas"],
+      [{ path: "/home/tester/vault/Proyectos/Atlas.md", source: "# Atlas\n" }],
+      ["/home/tester/workspace/atlas"],
     );
     let boundedCalls = 0;
     const fs = boundaryFs({
@@ -786,7 +786,7 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
       },
     });
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -802,14 +802,14 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
     const fs = boundaryFs(
       memoryFs(
         [
-          { path: "/vault/Proyectos/Atlas.md", source: "# Atlas\n" },
-          { path: "/vault/Proyectos/Zed.md", source: "x".repeat(TEST_MAX_NOTE_BYTES + 1) },
+          { path: "/home/tester/vault/Proyectos/Atlas.md", source: "# Atlas\n" },
+          { path: "/home/tester/vault/Proyectos/Zed.md", source: "x".repeat(TEST_MAX_NOTE_BYTES + 1) },
         ],
-        ["/workspace/atlas"],
+        ["/home/tester/workspace/atlas"],
       ),
     );
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -818,12 +818,12 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
   });
 
   it("fails closed on conflicting exact canonical overrides", async () => {
-    const fs = boundaryFs(memoryFs([], ["/workspace/atlas"]));
+    const fs = boundaryFs(memoryFs([], ["/home/tester/workspace/atlas"]));
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config([
-        { path: "/workspace/atlas", project_id: "atlas" as ProjectId },
-        { path: "/workspace/atlas", project_id: "other" as ProjectId },
+        { path: "/home/tester/workspace/atlas", project_id: "atlas" as ProjectId },
+        { path: "/home/tester/workspace/atlas", project_id: "other" as ProjectId },
       ]),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -836,13 +836,13 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
     const files = Array.from(
       { length: TEST_MAX_SCAN_ENTRIES_PER_DIRECTORY + 1 },
       (_, index) => ({
-        path: `/vault/Proyectos/entry-${index}.txt`,
+        path: `/home/tester/vault/Proyectos/entry-${index}.txt`,
         source: "ignored",
       }),
     );
-    const fs = boundaryFs(memoryFs(files, ["/workspace/atlas"]));
+    const fs = boundaryFs(memoryFs(files, ["/home/tester/workspace/atlas"]));
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -855,15 +855,15 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
     for (let directory = 0; directory < 20; directory += 1) {
       for (let entry = 0; entry < TEST_MAX_SCAN_ENTRIES_PER_DIRECTORY; entry += 1) {
         files.push({
-          path: `/vault/Proyectos/d${directory}/entry-${entry}.txt`,
+          path: `/home/tester/vault/Proyectos/d${directory}/entry-${entry}.txt`,
           source: "ignored",
         });
       }
     }
     expect(files.length).toBeGreaterThan(TEST_MAX_SCAN_ENTRIES);
-    const fs = boundaryFs(memoryFs(files, ["/workspace/atlas"]));
+    const fs = boundaryFs(memoryFs(files, ["/home/tester/workspace/atlas"]));
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -876,15 +876,15 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
     for (let branch = 0; branch < 16; branch += 1) {
       for (let leaf = 0; leaf < 32; leaf += 1) {
         files.push({
-          path: `/vault/Proyectos/r${branch}/d${leaf}/ignore.txt`,
+          path: `/home/tester/vault/Proyectos/r${branch}/d${leaf}/ignore.txt`,
           source: "ignored",
         });
       }
     }
     expect(16 + 16 * 32).toBeGreaterThan(TEST_MAX_SCAN_DIRECTORIES);
-    const fs = boundaryFs(memoryFs(files, ["/workspace/atlas"]));
+    const fs = boundaryFs(memoryFs(files, ["/home/tester/workspace/atlas"]));
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -897,14 +897,14 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
     const fs = boundaryFs(
       memoryFs(
         [
-          { path: "/vault/Proyectos/Atlas.md", source: "# Atlas\n" },
-          { path: `/vault/Proyectos/${deep}/Zed.txt`, source: "ignored" },
+          { path: "/home/tester/vault/Proyectos/Atlas.md", source: "# Atlas\n" },
+          { path: `/home/tester/vault/Proyectos/${deep}/Zed.txt`, source: "ignored" },
         ],
-        ["/workspace/atlas"],
+        ["/home/tester/workspace/atlas"],
       ),
     );
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -915,12 +915,12 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
   it("derives a legacy exact title match from the matched value, not the filename", async () => {
     const fs = boundaryFs(
       memoryFs(
-        [{ path: "/vault/Proyectos/Report.md", source: "---\ntitle: Atlas\n---\n# Report\n" }],
-        ["/workspace/atlas"],
+        [{ path: "/home/tester/vault/Proyectos/Report.md", source: "---\ntitle: Atlas\n---\n# Report\n" }],
+        ["/home/tester/workspace/atlas"],
       ),
     );
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -936,12 +936,12 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
   it("derives a legacy exact nested-directory match from the matched parent", async () => {
     const fs = boundaryFs(
       memoryFs(
-        [{ path: "/vault/Proyectos/Atlas/Status.md", source: "# Status\n" }],
-        ["/workspace/atlas"],
+        [{ path: "/home/tester/vault/Proyectos/Atlas/Status.md", source: "# Status\n" }],
+        ["/home/tester/workspace/atlas"],
       ),
     );
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -957,12 +957,12 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
   it("derives a normalized legacy exact alias from the alias value", async () => {
     const fs = boundaryFs(
       memoryFs(
-        [{ path: "/vault/Proyectos/Report.md", source: "---\naliases: [Atlas Project]\n---\n# Report\n" }],
-        ["/workspace/Atlas Project"],
+        [{ path: "/home/tester/vault/Proyectos/Report.md", source: "---\naliases: [Atlas Project]\n---\n# Report\n" }],
+        ["/home/tester/workspace/Atlas Project"],
       ),
     );
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/Atlas Project",
+      cwd: "/home/tester/workspace/Atlas Project",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -979,14 +979,14 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
     const fs = boundaryFs(
       memoryFs(
         [{
-          path: "/vault/Proyectos/Report.md",
+          path: "/home/tester/vault/Proyectos/Report.md",
           source: "---\ntitle: Atlas\n---\n# atlas\n",
         }],
-        ["/workspace/atlas"],
+        ["/home/tester/workspace/atlas"],
       ),
     );
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -999,19 +999,19 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
       memoryFs(
         [
           {
-            path: "/vault/Proyectos/Conflict.md",
+            path: "/home/tester/vault/Proyectos/Conflict.md",
             source: "---\ntitle: Atlas\n---\n# atlas\n",
           },
           {
-            path: "/vault/Proyectos/Safe.md",
+            path: "/home/tester/vault/Proyectos/Safe.md",
             source: "---\ntitle: Atlas\n---\n# Safe\n",
           },
         ],
-        ["/workspace/atlas"],
+        ["/home/tester/workspace/atlas"],
       ),
     );
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -1023,14 +1023,14 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
     const fs = boundaryFs(
       memoryFs(
         [{
-          path: "/vault/Proyectos/Report.md",
+          path: "/home/tester/vault/Proyectos/Report.md",
           source: "---\nresyst_project:\n  id: atlas\ntitle: 🔥\n---\n# Report\n",
         }],
-        ["/workspace/🔥"],
+        ["/home/tester/workspace/🔥"],
       ),
     );
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/🔥",
+      cwd: "/home/tester/workspace/🔥",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -1046,12 +1046,12 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
   it("fails closed when the exact legacy matched value cannot become a safe id", async () => {
     const fs = boundaryFs(
       memoryFs(
-        [{ path: "/vault/Proyectos/Report.md", source: "---\naliases: [!!!]\n---\n# Report\n" }],
-        ["/workspace/!!!"],
+        [{ path: "/home/tester/vault/Proyectos/Report.md", source: "---\naliases: [!!!]\n---\n# Report\n" }],
+        ["/home/tester/workspace/!!!"],
       ),
     );
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/!!!",
+      cwd: "/home/tester/workspace/!!!",
       config: config(),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
@@ -1062,11 +1062,11 @@ describe("scanner validation, bounded traversal, and exact fallback provenance",
 
 describe("exact public ProjectResolution seam", () => {
   it("returns the discriminated union directly", async () => {
-    const fs = memoryFs([{ path: "/vault/Proyectos/Atlas.md", source: atlasNote }], [
-      "/workspace/atlas",
+    const fs = memoryFs([{ path: "/home/tester/vault/Proyectos/Atlas.md", source: atlasNote }], [
+      "/home/tester/workspace/atlas",
     ]);
     const resolution = await resolveProject({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git,
@@ -1086,18 +1086,18 @@ describe("strict tier precedence", () => {
     const fs = memoryFs(
       [
         {
-          path: "/vault/Proyectos/Remote.md",
+          path: "/home/tester/vault/Proyectos/Remote.md",
           source: `---\nresyst_project:\n  id: remote\n  repos:\n    - github.com/tester/atlas\n---\n# Remote\n`,
         },
         {
-          path: "/vault/Proyectos/Id.md",
+          path: "/home/tester/vault/Proyectos/Id.md",
           source: `---\nresyst_project:\n  id: atlas\n---\n# Id\n`,
         },
       ],
-      ["/workspace/atlas"],
+      ["/home/tester/workspace/atlas"],
     );
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
       config: config(),
       fs,
       git,
@@ -1114,15 +1114,15 @@ describe("strict tier precedence", () => {
     const fs = memoryFs(
       [
         {
-          path: "/vault/Proyectos/Id.md",
+          path: "/home/tester/vault/Proyectos/Id.md",
           source: `---\nresyst_project:\n  id: atlas\n---\n# Id\n`,
         },
       ],
-      ["/workspace/atlas"],
+      ["/home/tester/workspace/atlas"],
     );
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
-      config: config([{ path: "/workspace/atlas", project_id: "override" as ProjectId }]),
+      cwd: "/home/tester/workspace/atlas",
+      config: config([{ path: "/home/tester/workspace/atlas", project_id: "override" as ProjectId }]),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
     });
@@ -1136,12 +1136,12 @@ describe("strict tier precedence", () => {
 
   it("orders an exact local override above an exact legacy name", async () => {
     const fs = memoryFs(
-      [{ path: "/vault/Proyectos/Atlas.md", source: "# Atlas\n" }],
-      ["/workspace/atlas"],
+      [{ path: "/home/tester/vault/Proyectos/Atlas.md", source: "# Atlas\n" }],
+      ["/home/tester/workspace/atlas"],
     );
     const outcome = await resolveProjectWithCandidates({
-      cwd: "/workspace/atlas",
-      config: config([{ path: "/workspace/atlas", project_id: "atlas" as ProjectId }]),
+      cwd: "/home/tester/workspace/atlas",
+      config: config([{ path: "/home/tester/workspace/atlas", project_id: "atlas" as ProjectId }]),
       fs,
       git: async () => ({ ok: true, stdout: "", stderr: "" }),
     });

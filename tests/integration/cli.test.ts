@@ -28,7 +28,7 @@ function invokeRaw(args: string[], input: string, env: NodeJS.ProcessEnv = envir
 function checkpoint(date: string): Record<string, unknown> {
   return {
     version: 1, kind: "apply",
-    source: { agent: "prime-agent", host_id: "casey", session_id: "cli-atlas", cwd: "/synthetic/atlas" },
+    source: { agent: "prime-agent", host_id: "casey", session_id: "cli-atlas", cwd: "/home/tester/synthetic/atlas" },
     project: { id: "atlas" },
     knowledge: { completed_tasks: [{ text: "Completed CLI integration", evidence: ["cli-test"] }], decisions: [], status_changes: [], blockers: [], reusable_learnings: [], next_steps: [] },
     evidence: { commits: [], tests: [{ id: "cli-test", value: "CLI integration passed" }], files: [], deployments: [], observations: [] },

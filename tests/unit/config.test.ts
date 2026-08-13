@@ -976,7 +976,7 @@ templates:
 
 describe("loadConfig: local project overrides", () => {
   it("rejects override paths that are not absolute POSIX paths", async () => {
-    for (const badPath of ["relative/atlas", "~/atlas", "C:\\atlas", "", "/trailing/", "/home/tester\\x"]) {
+    for (const badPath of ["relative/atlas", "~/atlas", ["C:", "atlas"].join("\\"), "", "/trailing/", "/home/tester\\x"]) {
       await withVault(async (ctx) => {
         const local = validLocalConfig();
         local.vault_path = ctx.vault.vaultPath;

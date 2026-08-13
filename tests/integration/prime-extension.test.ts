@@ -46,14 +46,14 @@ function harness(): Harness {
   return { handlers, tools, appendEntry, api: raw as unknown as ExtensionAPI };
 }
 
-function context(header: unknown, cwd = "/synthetic/atlas"): ExtensionContext {
+function context(header: unknown, cwd = "/home/tester/synthetic/atlas"): ExtensionContext {
   return {
     cwd,
     sessionManager: {
       getHeader: () => header,
       getSessionId: () => "spoofable-session-method",
       getSessionName: () => "root-looking-name",
-      getSessionFile: () => "/root/session.jsonl",
+      getSessionFile: () => "/home/tester/session.jsonl",
     },
     model: { id: "spoofable-model" },
   } as unknown as ExtensionContext;
@@ -124,7 +124,7 @@ describe("Prime extension integration", () => {
     const first = (await emit(fixture, "before_agent_start", before(), ctx))[0] as BeforeAgentStartEventResult;
     const duplicate = (await emit(fixture, "before_agent_start", before(), ctx))[0];
     expect(bootstrap).toHaveBeenCalledTimes(1);
-    expect(bootstrap).toHaveBeenCalledWith({ cwd: "/synthetic/atlas" });
+    expect(bootstrap).toHaveBeenCalledWith({ cwd: "/home/tester/synthetic/atlas" });
     expect(Object.keys(first)).toEqual(["systemPrompt"]);
     const augmented = first.systemPrompt ?? "";
     expect(augmented.startsWith("BASE\n\n")).toBe(true);
@@ -164,7 +164,7 @@ describe("Prime extension integration", () => {
         },
         getSessionId: () => "spoofable-session-method",
         getSessionName: () => "root-looking-name",
-        getSessionFile: () => "/root/session.jsonl",
+        getSessionFile: () => "/home/tester/session.jsonl",
       },
       {
         get(target, key) {
@@ -178,7 +178,7 @@ describe("Prime extension integration", () => {
       },
     );
     const throwingCtx = {
-      cwd: "/synthetic/atlas",
+      cwd: "/home/tester/synthetic/atlas",
       sessionManager: throwingManager,
     } as unknown as ExtensionContext;
     const throwingResult = (

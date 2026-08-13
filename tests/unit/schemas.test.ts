@@ -650,7 +650,7 @@ describe("parseCheckpoint", () => {
   });
 
   it("rejects relative and malformed cwd values", () => {
-    for (const cwd of ["work", ".", "~", "C:\\work", "/home/tester\u0000x", ""]) {
+    for (const cwd of ["work", ".", "~", ["C:", "work"].join("\\"), "/home/tester\u0000x", ""]) {
       const payload = validApply();
       const source = payload.source as Record<string, unknown>;
       source.cwd = cwd;

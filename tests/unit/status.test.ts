@@ -14,7 +14,7 @@ const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 
 function checkpoint(): ApplyCheckpoint { return {
-  version: 1, kind: "apply", source: { agent: "prime-agent", host_id: "casey" as HostId, session_id: "session-atlas" as SessionId, cwd: "/synthetic/atlas" },
+  version: 1, kind: "apply", source: { agent: "prime-agent", host_id: "casey" as HostId, session_id: "session-atlas" as SessionId, cwd: "/home/tester/synthetic/atlas" },
   project: { id: "atlas" as ProjectId }, knowledge: { completed_tasks: [{ text: "Status fixture", evidence: ["status-test" as EvidenceId] }], decisions: [], status_changes: [], blockers: [], reusable_learnings: [], next_steps: [] },
   evidence: { commits: [], tests: [{ id: "status-test" as EvidenceId, value: "status unit" }], files: [], deployments: [], observations: [] }, targets: { daily: true, project: false, landscape: false },
 }; }

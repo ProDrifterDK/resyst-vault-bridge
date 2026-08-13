@@ -10,7 +10,7 @@ function applyPayload(): Record<string, unknown> {
       agent: "prime-agent",
       host_id: "workstation",
       session_id: "sess-01ab",
-      cwd: "/workspace/atlas",
+      cwd: "/home/tester/workspace/atlas",
     },
     project: { id: "atlas" },
     knowledge: {

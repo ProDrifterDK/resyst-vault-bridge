@@ -60,10 +60,10 @@ the absolute vault path.
 {
   "version": 1,
   "host_id": "casey",
-  "vault_path": "/home/casey/Notes",
+  "vault_path": "/home/tester/Notes",
   "project_overrides": [
     {
-      "path": "/home/casey/work/atlas",
+      "path": "/home/tester/atlas",
       "project_id": "atlas"
     }
   ]

@@ -18,7 +18,7 @@ const hash = (value: string): HashHex => createHash("sha256").update(value, "utf
 function checkpoint(): ApplyCheckpoint {
   return {
     version: 1, kind: "apply",
-    source: { agent: "prime-agent", host_id: "casey" as HostId, session_id: "session-atlas" as SessionId, cwd: "/synthetic/atlas" },
+    source: { agent: "prime-agent", host_id: "casey" as HostId, session_id: "session-atlas" as SessionId, cwd: "/home/tester/synthetic/atlas" },
     project: { id: "atlas" as ProjectId },
     knowledge: { completed_tasks: [{ text: "Applied Atlas", evidence: ["test-rollback" as EvidenceId] }], decisions: [], status_changes: [], blockers: [], reusable_learnings: [], next_steps: [] },
     evidence: { commits: [], tests: [{ id: "test-rollback" as EvidenceId, value: "rollback integration" }], files: [], deployments: [], observations: [] },
