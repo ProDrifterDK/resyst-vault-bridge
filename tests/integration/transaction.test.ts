@@ -239,6 +239,18 @@ describe("TransactionService single-target apply", () => {
     expect(await readFile(target, "utf8")).toBe(before + "concurrent");
   });
 
+  it("converges concurrent same-intent event publication with different timestamps", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "resyst-tx-event-race-")); roots.push(root);
+    await createVault({ vaultPath: root, withDailyNote: true });
+    const { absolute: target, before } = await targetSource(root);
+    const firstTx = await service(root);
+    const secondTx = await service(root);
+    const request = input(before + "event race", hash(before), "9".repeat(64), "evt-event-race");
+    const outcomes = await Promise.all([firstTx.apply(request), secondTx.apply(request)]);
+    expect(outcomes.map((outcome) => outcome.kind).sort()).toEqual(["already_applied", "applied"]);
+    expect(await readFile(target, "utf8")).toBe(before + "event race");
+  });
+
   it("recovers a crash after durable rename/progress without creating a failed receipt", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "resyst-tx-crash-")); roots.push(root);
     await createVault({ vaultPath: root, withDailyNote: true });

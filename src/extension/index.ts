@@ -18,8 +18,10 @@
  * the bridge.
  */
 import type {
+  AgentToolResult,
   BeforeAgentStartEventResult,
   ExtensionAPI,
+  ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import path from "node:path";
 import {
@@ -27,15 +29,48 @@ import {
   BootstrapLoopCache,
   safeReadStringProperty,
 } from "./host.js";
-import { createProductionService } from "./tools.js";
 import {
-  registerReadTools,
+  CHECKPOINT_STATE_CUSTOM_TYPE,
+  MAX_CHECKPOINT_MIRRORS,
+  EffectTracker,
+  isCheckpointStateRecord,
+  reconcileCheckpointState,
+  reduceCheckpointState,
+  PendingStateStore,
+  type CheckpointStateRecord,
+  type EffectTrackerOptions,
+} from "./state.js";
+import {
+  CwdSchema,
+  IsoTimestampSchema,
+  SessionIdSchema,
+  parseWithSchema,
+} from "../schemas.js";
+import {
+  createProductionService,
   type BridgeReadService,
+  registerReadTools,
 } from "./tools.js";
+import {
+  CHECKPOINT_TOOL_UNAVAILABLE,
+  checkpointToolDefinition,
+  checkpointReceipt,
+  VaultCheckpointParametersSchema,
+  type CheckpointOutcome,
+  type CheckpointService,
+  type CheckpointTool,
+  type CheckpointToolDetails,
+  validateCheckpointResult,
+} from "./checkpoint.js";
+import type { SessionId } from "../types.js";
 
-/** Optional service injection; the production service is the default. */
+/** Optional service and checkpoint-adapter injection; production is the default. */
 export interface CreateVaultExtensionOptions {
   service?: BridgeReadService;
+  checkpointService?: CheckpointService;
+  checkpointStateStore?: PendingStateStore;
+  now?: () => Date;
+  substantialTools?: EffectTrackerOptions["substantialTools"];
 }
 
 /** Conservative upper bound on the event prompt accepted by the bridge. */
@@ -76,23 +111,97 @@ export function createVaultExtension(
   options: CreateVaultExtensionOptions = {},
 ): (api: ExtensionAPI) => void {
   const service = options.service ?? createProductionService();
+  let checkpointService: CheckpointService | null = options.checkpointService ?? null;
+  let stateStore: PendingStateStore | null = options.checkpointStateStore ?? null;
+  const now = options.now ?? (() => new Date());
+  const effects = new EffectTracker({
+    ...(options.substantialTools === undefined ? {} : { substantialTools: options.substantialTools }),
+  });
+  const checkpointRegistration = { registered: false };
+  let checkpoint: CheckpointTool | null = null;
+  let activeRoot: CheckpointRoot | null = null;
+
   return (api: ExtensionAPI): void => {
     const cache = new BootstrapLoopCache();
     registerReadTools(api, service);
     api.on("before_agent_start", (event, ctx) =>
       handleBeforeAgentStart(event, ctx, service, cache),
     );
-    api.on("agent_end", () => {
+    api.on("agent_end", () => { cache.clear(); });
+    api.on("session_start", async (event, ctx) => {
       cache.clear();
+      effects.clear();
+      const root = currentCheckpointRoot(ctx);
+      const reason = ownDataProperty(event, "reason");
+      if (
+        root === null ||
+        !reason.present ||
+        typeof reason.value !== "string" ||
+        !["startup", "reload", "new", "resume", "fork"].includes(reason.value)
+      ) {
+        if (checkpointRegistration.registered) setCheckpointActive(api, false);
+        activeRoot = null;
+        return;
+      }
+      if (stateStore === null) {
+        try { stateStore = new PendingStateStore(); }
+        catch { activeRoot = null; return; }
+      }
+      if (checkpointService === null) {
+        try {
+          const module = await import("../checkpoint-service.js");
+          checkpointService = module.createProductionCheckpointService();
+        } catch { activeRoot = null; return; }
+      }
+      if (checkpoint === null) {
+        const store = stateStore;
+        const serviceForCheckpoint = checkpointService;
+        checkpoint = checkpointToolDefinition(
+          (callId, command, _signal, _onUpdate, toolContext) =>
+            executeCheckpoint(
+              callId,
+              command,
+              toolContext,
+              api,
+              store,
+              serviceForCheckpoint,
+              now,
+              activeRoot,
+            ),
+        );
+      }
+      return await handleSessionStart(
+        event,
+        ctx,
+        api,
+        stateStore,
+        now,
+        checkpoint,
+        checkpointRegistration,
+        (value) => { activeRoot = value; },
+      );
     });
-    api.on("session_start", () => {
-      cache.clear();
+    api.on("session_compact", (event, ctx) => {
+      const store = stateStore;
+      if (store === null) return;
+      return handleSessionCompact(event, ctx, api, store, activeRoot);
+    });
+    api.on("tool_result", (event, ctx) => {
+      const store = stateStore;
+      if (store === null) return;
+      return handleToolResult(event, ctx, api, store, now, effects, activeRoot);
     });
     api.on("session_shutdown", () => {
       cache.clear();
+      effects.clear();
+      if (checkpointRegistration.registered) setCheckpointActive(api, false);
+      activeRoot = null;
     });
     api.on("session_before_switch", () => {
       cache.clear();
+      effects.clear();
+      if (checkpointRegistration.registered) setCheckpointActive(api, false);
+      activeRoot = null;
     });
   };
 }
@@ -139,6 +248,401 @@ function safeAbsoluteCwd(value: unknown): string | null {
   if (value.length === 0 || value.length > 4096) return null;
   if (!path.isAbsolute(value)) return null;
   return value;
+}
+
+interface CheckpointRoot {
+  sessionId: SessionId;
+  cwd: string;
+}
+
+interface ActiveCheckpointContext {
+  root: CheckpointRoot;
+  state: CheckpointStateRecord;
+}
+
+const CHECKPOINT_STATE_WARNING_CUSTOM_TYPE = "resyst-vault.checkpoint-warning";
+const CHECKPOINT_STATE_WARNING = { version: 1 as const, status: "pending_unpersisted" as const };
+
+interface CheckpointMutationResult {
+  state: CheckpointStateRecord;
+  persisted: boolean;
+}
+
+function ownDataProperty(
+  value: unknown,
+  key: string,
+): { present: boolean; value: unknown } {
+  if (value === null || typeof value !== "object") {
+    return { present: false, value: undefined };
+  }
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !("value" in descriptor)) {
+      return { present: false, value: undefined };
+    }
+    return { present: true, value: descriptor.value };
+  } catch {
+    return { present: false, value: undefined };
+  }
+}
+
+function checkpointNow(now: () => Date): string {
+  try {
+    return parseWithSchema(
+      IsoTimestampSchema,
+      now().toISOString(),
+      "checkpoint state timestamp",
+    );
+  } catch {
+    throw new Error("checkpoint state timestamp is invalid");
+  }
+}
+
+function currentCheckpointRoot(ctx: ExtensionContext): CheckpointRoot | null {
+  const header = safeReadHeader(ctx);
+  if (header === null || !authorityFromHeader(header).is_root) return null;
+  const rawSessionId = safeReadStringProperty(header, "id", 4096);
+  const rawCwd = safeReadStringProperty(ctx, "cwd", 4096);
+  if (rawSessionId === null || rawCwd === null) return null;
+  try {
+    const sessionId = parseWithSchema(
+      SessionIdSchema,
+      rawSessionId,
+      "checkpoint session id",
+    );
+    const cwd = parseWithSchema(CwdSchema, rawCwd, "checkpoint cwd");
+    if (Buffer.byteLength(cwd, "utf8") > 4096) return null;
+    return { sessionId, cwd };
+  } catch {
+    return null;
+  }
+}
+
+function activeCheckpointContext(
+  ctx: ExtensionContext,
+  activeRoot: CheckpointRoot | null,
+  stateStore: PendingStateStore,
+): Promise<ActiveCheckpointContext | null> {
+  return (async () => {
+    if (activeRoot === null) return null;
+    const current = currentCheckpointRoot(ctx);
+    if (
+      current === null ||
+      current.sessionId !== activeRoot.sessionId ||
+      current.cwd !== activeRoot.cwd
+    ) return null;
+    try {
+      const state = await stateStore.current(String(current.sessionId));
+      if (state === null || state.session_id !== current.sessionId) return null;
+      return { root: current, state };
+    } catch {
+      return null;
+    }
+  })();
+}
+
+function safePrototypeMethod(value: object, key: string): ((...arguments_: unknown[]) => unknown) | null {
+  let current: object | null = value;
+  for (let depth = 0; depth < 8 && current !== null; depth += 1) {
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(current, key);
+      if (descriptor !== undefined) {
+        return "value" in descriptor && typeof descriptor.value === "function"
+          ? descriptor.value as (...arguments_: unknown[]) => unknown
+          : null;
+      }
+      current = Object.getPrototypeOf(current) as object | null;
+    } catch { return null; }
+  }
+  return null;
+}
+
+function safeManagerEntries(source: unknown): unknown[] {
+  if (source === null || typeof source !== "object") return [];
+  const manager = ownDataProperty(source, "sessionManager");
+  if (!manager.present || manager.value === null || typeof manager.value !== "object") return [];
+  const getEntries = safePrototypeMethod(manager.value, "getEntries");
+  if (getEntries === null) return [];
+  try {
+    const value = getEntries.call(manager.value);
+    if (!Array.isArray(value)) return [];
+    if (value.length > MAX_CHECKPOINT_MIRRORS * 4_096) return [];
+    return value;
+  } catch { return []; }
+}
+
+function checkpointMirrors(ctx: ExtensionContext): CheckpointStateRecord[] {
+  const mirrors: CheckpointStateRecord[] = [];
+  const entries = safeManagerEntries(ctx);
+  for (let index = entries.length - 1; index >= 0 && mirrors.length < MAX_CHECKPOINT_MIRRORS; index -= 1) {
+    const value = entries[index];
+    if (value === null || typeof value !== "object") continue;
+    const type = ownDataProperty(value, "type");
+    const customType = ownDataProperty(value, "customType");
+    const data = ownDataProperty(value, "data");
+    if (
+      !type.present || type.value !== "custom" ||
+      !customType.present || customType.value !== CHECKPOINT_STATE_CUSTOM_TYPE ||
+      !data.present
+    ) continue;
+    if (isCheckpointStateRecord(data.value)) mirrors.push(data.value);
+  }
+  return mirrors;
+}
+
+async function persistCheckpointMutation(
+  api: ExtensionAPI,
+  stateStore: PendingStateStore,
+  root: CheckpointRoot,
+  now: () => Date,
+  event:
+    | { kind: "substantial" }
+    | { kind: "uncertain" }
+    | { kind: "checkpoint_outcome"; outcome: CheckpointOutcome; basis_revision: number },
+): Promise<CheckpointMutationResult | null> {
+  try {
+    const state = await stateStore.update(String(root.sessionId), (current) => {
+      if (current === null || current.session_id !== root.sessionId) {
+        throw new Error("checkpoint state unavailable");
+      }
+      return reduceCheckpointState(current, event, checkpointNow(now));
+    });
+    try {
+      api.appendEntry(CHECKPOINT_STATE_CUSTOM_TYPE, state);
+    } catch {
+      return { state, persisted: false };
+    }
+    return { state, persisted: true };
+  } catch {
+    if (stateStore.hasVolatilePending(String(root.sessionId))) {
+      try { api.appendEntry(CHECKPOINT_STATE_WARNING_CUSTOM_TYPE, CHECKPOINT_STATE_WARNING); }
+      catch { /* Best-effort fixed warning; runtime fallback remains pending. */ }
+    }
+    return null;
+  }
+}
+
+function mutationEvent(
+  outcome: CheckpointOutcome,
+  basisRevision: number,
+): { kind: "checkpoint_outcome"; outcome: CheckpointOutcome; basis_revision: number } {
+  return { kind: "checkpoint_outcome", outcome, basis_revision: basisRevision };
+}
+
+function setCheckpointActive(api: ExtensionAPI, active: boolean): boolean {
+  const getActive = safePrototypeMethod(api, "getActiveTools");
+  const setActive = safePrototypeMethod(api, "setActiveTools");
+  if (getActive === null || setActive === null) return false;
+  try {
+    const value = getActive.call(api);
+    if (!Array.isArray(value) || value.length > 4_096 || value.some((name) => typeof name !== "string")) {
+      return false;
+    }
+    const next = value.filter((name) => name !== "vault_checkpoint");
+    if (active) next.push("vault_checkpoint");
+    setActive.call(api, [...new Set(next)]);
+    const verified = getActive.call(api);
+    return Array.isArray(verified) &&
+      verified.every((name) => typeof name === "string") &&
+      verified.includes("vault_checkpoint") === active;
+  } catch { return false; }
+}
+
+async function handleSessionStart(
+  event: unknown,
+  ctx: ExtensionContext,
+  api: ExtensionAPI,
+  stateStore: PendingStateStore,
+  now: () => Date,
+  checkpoint: CheckpointTool,
+  registration: { registered: boolean },
+  setActiveRoot: (root: CheckpointRoot | null) => void,
+): Promise<void> {
+  const type = ownDataProperty(event, "type");
+  const reasonValue = ownDataProperty(event, "reason");
+  if (
+    !type.present ||
+    type.value !== "session_start" ||
+    !reasonValue.present ||
+    typeof reasonValue.value !== "string" ||
+    !["startup", "reload", "new", "resume", "fork"].includes(reasonValue.value)
+  ) {
+    if (registration.registered) setCheckpointActive(api, false);
+    setActiveRoot(null);
+    return;
+  }
+  const root = currentCheckpointRoot(ctx);
+  if (root === null) {
+    if (registration.registered) setCheckpointActive(api, false);
+    setActiveRoot(null);
+    return;
+  }
+  try {
+    const mirrors = checkpointMirrors(ctx);
+    const timestamp = checkpointNow(now);
+    const state = await stateStore.update(String(root.sessionId), (local) =>
+      reconcileCheckpointState({
+        sessionId: String(root.sessionId),
+        local,
+        mirrors,
+        reset: reasonValue.value === "new" || reasonValue.value === "fork",
+        now: timestamp,
+      }),
+    );
+    try {
+      api.appendEntry(CHECKPOINT_STATE_CUSTOM_TYPE, state);
+    } catch {
+      setActiveRoot(null);
+      return;
+    }
+    // Registration is late and one-shot. The first authoritative root that
+    // completes persistence also makes the tool available to this runtime.
+    if (!registration.registered) {
+      api.registerTool(checkpoint);
+      registration.registered = true;
+    }
+    if (!setCheckpointActive(api, true)) {
+      setActiveRoot(null);
+      return;
+    }
+    setActiveRoot(root);
+  } catch {
+    setActiveRoot(null);
+  }
+}
+
+async function handleSessionCompact(
+  event: unknown,
+  ctx: ExtensionContext,
+  api: ExtensionAPI,
+  stateStore: PendingStateStore,
+  activeRoot: CheckpointRoot | null,
+): Promise<void> {
+  const type = ownDataProperty(event, "type");
+  if (!type.present || type.value !== "session_compact") return;
+  const active = await activeCheckpointContext(ctx, activeRoot, stateStore);
+  if (active === null) return;
+  try {
+    // The mirror is re-read from disk immediately before append so the exact
+    // custom entry cannot advertise state newer than the local authority.
+    const state = await stateStore.load(String(active.root.sessionId));
+    if (state === null) return;
+    api.appendEntry(CHECKPOINT_STATE_CUSTOM_TYPE, state);
+  } catch {
+    // Compaction mirroring is best-effort and never fabricates a false record.
+  }
+}
+
+async function handleToolResult(
+  event: unknown,
+  ctx: ExtensionContext,
+  api: ExtensionAPI,
+  stateStore: PendingStateStore,
+  now: () => Date,
+  effects: EffectTracker,
+  activeRoot: CheckpointRoot | null,
+): Promise<void> {
+  const type = ownDataProperty(event, "type");
+  if (type.present && type.value !== "tool_result") return;
+  const active = await activeCheckpointContext(ctx, activeRoot, stateStore);
+  if (active === null) return;
+  const callId = ownDataProperty(event, "toolCallId");
+  const toolName = ownDataProperty(event, "toolName");
+  const isError = ownDataProperty(event, "isError");
+  const input = ownDataProperty(event, "input");
+  const effect = effects.observe({
+    tool_call_id: callId.present ? callId.value : undefined,
+    tool_name: toolName.present ? toolName.value : undefined,
+    is_error: isError.present ? isError.value : undefined,
+    input: input.present ? input.value : undefined,
+  });
+  if (effect === "ignore") return;
+  await persistCheckpointMutation(
+    api,
+    stateStore,
+    active.root,
+    now,
+    { kind: effect === "substantial" ? "substantial" : "uncertain" },
+  );
+}
+
+function unavailableToolResult(): {
+  content: [{ type: "text"; text: string }];
+  details: CheckpointToolDetails;
+} {
+  return {
+    content: [{ type: "text", text: CHECKPOINT_TOOL_UNAVAILABLE }],
+    details: { version: 1, outcome: "unavailable" },
+  };
+}
+
+function successfulToolResult(outcome: CheckpointOutcome): {
+  content: [{ type: "text"; text: string }];
+  details: CheckpointToolDetails;
+} {
+  return {
+    content: [{ type: "text", text: checkpointReceipt(outcome) }],
+    details: { version: 1, outcome },
+  };
+}
+
+async function executeCheckpoint(
+  _callId: string,
+  rawCommand: unknown,
+  ctx: ExtensionContext,
+  api: ExtensionAPI,
+  stateStore: PendingStateStore,
+  checkpointService: CheckpointService,
+  now: () => Date,
+  activeRoot: CheckpointRoot | null,
+): Promise<AgentToolResult<CheckpointToolDetails>> {
+  try {
+    const active = await activeCheckpointContext(ctx, activeRoot, stateStore);
+    if (active === null) return unavailableToolResult();
+    const command = parseWithSchema(
+      VaultCheckpointParametersSchema,
+      rawCommand,
+      "checkpoint command",
+    );
+    let basisRevision = active.state.revision;
+    if (command.kind === "apply") {
+      const pending = await persistCheckpointMutation(
+        api,
+        stateStore,
+        active.root,
+        now,
+        { kind: "substantial" },
+      );
+      if (pending === null || !pending.persisted) return unavailableToolResult();
+      basisRevision = pending.state.revision;
+    }
+    let outcome: CheckpointOutcome;
+    try {
+      const result = validateCheckpointResult(
+        await checkpointService.checkpoint({
+          command,
+          trusted: {
+            cwd: active.root.cwd,
+            session_id: String(active.root.sessionId),
+          },
+        }),
+      );
+      outcome = result.outcome;
+    } catch {
+      return unavailableToolResult();
+    }
+    const mutation = await persistCheckpointMutation(
+      api,
+      stateStore,
+      active.root,
+      now,
+      mutationEvent(outcome, basisRevision),
+    );
+    if (mutation === null || !mutation.persisted) return unavailableToolResult();
+    return successfulToolResult(outcome);
+  } catch {
+    return unavailableToolResult();
+  }
 }
 
 /**

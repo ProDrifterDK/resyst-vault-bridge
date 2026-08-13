@@ -22,7 +22,8 @@ export type WritePlanReason =
   | "daily_update"
   | "project_update"
   | "landscape_moc"
-  | "landscape_claude";
+  | "landscape_claude"
+  | "association_proposal";
 
 export interface WritePlan {
   path: VaultPath;

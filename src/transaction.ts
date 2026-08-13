@@ -14,6 +14,7 @@ import type { FileHandle } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type { BridgeConfig } from "./config.js";
 import { JournalIntegrityError, JournalStore } from "./journal.js";
 import { LocalLock, LockTimeoutError, type LockHandle } from "./lock.js";
@@ -36,6 +37,8 @@ import type {
   HashHex,
   IdempotencyKey,
   JournalEvent,
+  NoopCheckpoint,
+  NoopReceipt,
   Receipt,
   VaultPath,
 } from "./types.js";
@@ -61,6 +64,12 @@ export interface TransactionInput {
     afterRenamePreProgress?: (plan: WritePlan, index: number) => Promise<void>;
     afterRename?: (plan: WritePlan, index: number) => Promise<void>;
   };
+}
+
+export interface NoopTransactionInput {
+  checkpoint: NoopCheckpoint;
+  idempotency_key: IdempotencyKey;
+  event_id: EventId;
 }
 
 export interface TransactionServiceOptions {
@@ -207,7 +216,7 @@ function safePlan(value: unknown): WritePlan {
   const after = parseWithSchema(HashHexSchema, record.after_hash, "transaction after hash");
   if (typeof record.after_content !== "string" || record.after_content.length > 1_000_000) throw new TransactionIntegrityError();
   if (hashContent(record.after_content) !== after) throw new TransactionIntegrityError();
-  const reasons = ["daily_create", "daily_update", "project_update", "landscape_moc", "landscape_claude"];
+  const reasons = ["daily_create", "daily_update", "project_update", "landscape_moc", "landscape_claude", "association_proposal"];
   if (typeof record.reason !== "string" || !reasons.includes(record.reason)) throw new TransactionIntegrityError();
   return { path: pathValue, before_hash: before, after_content: record.after_content, after_hash: after, reason: record.reason as WritePlan["reason"] };
 }
@@ -500,6 +509,37 @@ function proposalText(input: TransactionInput, target: VaultPath): string {
   return result;
 }
 
+function narrowNoopInput(value: unknown): NoopTransactionInput {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TransactionIntegrityError();
+  }
+  const record = value as Record<string, unknown>;
+  let checkpoint: ReturnType<typeof parseCheckpoint>;
+  try { checkpoint = parseCheckpoint(record.checkpoint); }
+  catch { throw new TransactionIntegrityError(); }
+  if (checkpoint.kind !== "noop") throw new TransactionIntegrityError();
+  return {
+    checkpoint,
+    event_id: safeEventId(record.event_id),
+    idempotency_key: safeKey(record.idempotency_key),
+  };
+}
+
+function sameApplyIntent(event: JournalEvent, input: TransactionInput): boolean {
+  if (
+    event.kind !== "apply" ||
+    event.event_id !== input.event_id ||
+    event.idempotency_key !== input.idempotency_key
+  ) return false;
+  const targets = input.plans.map((plan) => ({
+    path: plan.path,
+    before_hash: plan.before_hash,
+    after_hash: plan.after_hash,
+  }));
+  return isDeepStrictEqual(event.checkpoint, input.checkpoint) &&
+    isDeepStrictEqual(event.planned_targets, targets);
+}
+
 export class TransactionService {
   readonly vaultRoot: string;
   readonly stateRoot: string;
@@ -713,12 +753,70 @@ export class TransactionService {
     return this.outcomeApplied(input);
   }
 
+  /** Persist one immutable noop evaluation under the transaction lock. */
+  async recordNoop(value: unknown): Promise<CheckpointOutcome> {
+    const input = narrowNoopInput(value);
+    let held: LockHandle;
+    try { held = await this.lock.acquire(); }
+    catch { throw new TransactionIntegrityError(); }
+    let outcome: CheckpointOutcome | undefined;
+    let operationError: unknown;
+    try {
+      const existing = await this.journal.findReceiptByIdempotency(input.idempotency_key);
+      if (existing !== null) {
+        if (existing.receipt.outcome !== "noop") throw new TransactionIntegrityError();
+        outcome = {
+          kind: "noop",
+          event_id: existing.event_id,
+          receipt: existing.receipt,
+          reason: input.checkpoint.reason,
+        };
+      } else {
+        const prior = await this.journal.findEventByIdempotency(input.idempotency_key);
+        if (prior !== null && prior.kind !== "noop") throw new TransactionIntegrityError();
+        const eventId = prior?.event_id ?? input.event_id;
+        const event: JournalEvent = prior ?? {
+          version: 1,
+          kind: "noop",
+          event_id: eventId,
+          idempotency_key: input.idempotency_key,
+          created_at: nowIso(this.now),
+          checkpoint: input.checkpoint,
+        };
+        if (prior === null) await this.journal.writeEvent(event);
+        const receipt: NoopReceipt = {
+          version: 1,
+          outcome: "noop",
+          event_id: eventId,
+          idempotency_key: input.idempotency_key,
+          created_at: nowIso(this.now),
+        };
+        const durable = await this.journal.writeReceipt(receipt);
+        if (durable.outcome !== "noop" || durable.event_id !== eventId) {
+          throw new TransactionIntegrityError();
+        }
+        outcome = {
+          kind: "noop",
+          event_id: eventId,
+          receipt: durable,
+          reason: input.checkpoint.reason,
+        };
+      }
+    } catch (error) { operationError = error; }
+    let releaseError: unknown;
+    try { await held.release(); } catch (error) { releaseError = error; }
+    if (releaseError !== undefined || operationError !== undefined || outcome === undefined) {
+      throw new TransactionIntegrityError();
+    }
+    return outcome;
+  }
+
   async apply(value: unknown): Promise<CheckpointOutcome> {
     const input = narrowInput(value);
     const existing = await this.journal.findReceiptByIdempotency(input.idempotency_key);
     if (existing !== null) return this.outcomeFromReceipt(existing, input.idempotency_key);
 
-    const priorEvent = await this.journal.findEventByIdempotency(input.idempotency_key);
+    let priorEvent = await this.journal.findEventByIdempotency(input.idempotency_key);
     if (priorEvent !== null && priorEvent.kind !== "apply") {
       throw new TransactionIntegrityError();
     }
@@ -740,10 +838,13 @@ export class TransactionService {
         };
     try {
       if (priorEvent === null) await this.journal.writeEvent(event);
-    }
-    catch (error) {
-      if (error instanceof JournalIntegrityError) return this.outcomeFailed(effectiveInput, "io_error");
-      throw error;
+    } catch (error) {
+      if (!(error instanceof JournalIntegrityError)) throw error;
+      const concurrent = await this.journal.findEventByIdempotency(input.idempotency_key);
+      if (concurrent === null || !sameApplyIntent(concurrent, effectiveInput)) {
+        return this.outcomeFailed(effectiveInput, "io_error");
+      }
+      priorEvent = concurrent;
     }
 
     let held: LockHandle;

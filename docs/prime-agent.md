@@ -1,15 +1,18 @@
 # Prime Agent integration
 
 The Resyst Vault Bridge ships as an installable Prime Agent extension. The
-extension is read-only in this release: it injects an ephemeral vault
-bootstrap into every authoritative root turn and exposes bounded `vault_search`
-and `vault_read` tools at every RLM depth. Write authority is handled by a
-separate task.
+extension injects an ephemeral vault bootstrap into every authoritative root
+turn and exposes bounded `vault_search` and `vault_read` tools at every RLM
+depth. After a root session is validated and its machine-local pending state is
+durable, the extension registers `vault_checkpoint` only for that root. Child
+sessions never keep it active.
 
 ## Installation
 
-Prime Agent loads extensions from Git packages. Install the bridge from
-this repository:
+Prime Agent loads extensions from Git packages. This adapter requires Prime
+Agent `>=0.84.1`; that floor covers execute-time context, lifecycle events,
+sequential custom tools, active-tool updates, and immediate late registration.
+Install the bridge from this repository:
 
 ```text
 git:github.com/ProDrifterDK/resyst-vault-bridge
@@ -18,8 +21,10 @@ git:github.com/ProDrifterDK/resyst-vault-bridge
 Once installed, Prime Agent discovers the extension through the package's
 `pi.extensions` manifest and loads `./src/extension/index.ts`. Importing
 the module does not eagerly load any vault configuration; the bridge
-performs no filesystem read at import or registration. Filesystem access begins
-only when a root bootstrap or an explicit read tool is invoked.
+performs no filesystem read at import or registration. Mutation modules and
+machine-local checkpoint state are loaded lazily only after a validated root
+`session_start`; vault access begins only on bootstrap, an explicit read, or an
+explicit root checkpoint.
 
 ## Initial setup (read-only / dry-run)
 
@@ -39,8 +44,9 @@ adapter and use the CLI checkpoint dry-run separately:
    instruction-shaped vault content, or a literal `BEGIN`/`END`
    substring inside the payload cannot forge the framing.
 4. Confirm `vault_search` and `vault_read` are available to child sessions
-   while `vault_checkpoint` is absent (write authority belongs to a
-   separate task).
+   while `vault_checkpoint` is absent there. In a disposable synthetic root,
+   confirm the checkpoint tool appears only after root state persistence.
+   Do not invoke it against the real vault during this implementation gate.
 
 Only after the synthetic/read-only checks and `checkpoint --dry-run` match
 expectations should the extension be used with a real vault.
@@ -122,9 +128,11 @@ replay stale context.
   exhaust the host). Empty or failed loads delete the pending slot
   immediately so the next call can recover.
 
-The only durable vault artifacts produced by this release are those
-produced by the user's own vault tooling (not the bridge): the
-`vault_search` and `vault_read` tools never write to the vault.
+The bootstrap cache and read tools never write to the vault. An explicit,
+authorized root `vault_checkpoint` is different: it routes normalized apply or
+noop commands through the shared transaction service, immutable journal and
+receipt stores, and machine-local lock/state paths. Automatic evaluation is not
+enabled at this stage.
 
 ## Privacy and failure modes
 
@@ -136,9 +144,10 @@ produced by the user's own vault tooling (not the bridge): the
   result of an explicit `vault_read` or `vault_search` call appears in
   the tool transcript; bootstrap fragments are turn-scoped and never
   journaled.
-- **Service failures collapse to a fixed message.** Every tool failure
-  returns the constant `vault tool unavailable` with structured
-  `outcome: "unavailable"` details. The original error never reaches the
+- **Service failures collapse to fixed messages.** Read-tool failures return
+  `vault tool unavailable`; checkpoint failures return
+  `vault checkpoint unavailable`. Both use structured `outcome: "unavailable"`
+  details. The original error never reaches the
   user, the model, or stderr. Bootstrap reads surface redacted
   `SnapshotReadError` codes (`swap_detected`, `instability_detected`,
   `not_file`, `too_large`, `nul_byte`, `utf8_invalid`, …) that the
@@ -170,5 +179,6 @@ produced by the user's own vault tooling (not the bridge): the
   YAML, layout violations), Prime Agent continues to operate normally;
   `vault_search` and `vault_read` remain registered and return the fixed
   unavailable result rather than blocking ordinary agent work.
-- All vault writes belong to a separate task. This release is read-only
-  by design.
+- Vault writes occur only through an explicit authoritative-root checkpoint
+  and the core transaction service. Automatic missing-checkpoint evaluation
+  remains disabled until the next separately accepted task.
