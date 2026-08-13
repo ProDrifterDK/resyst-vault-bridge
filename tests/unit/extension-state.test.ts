@@ -60,6 +60,7 @@ describe("checkpoint state transitions", () => {
       { from: "substantial_pending", event: { kind: "begin_evaluation" }, to: "evaluating" },
       { from: "evaluation_pending", event: { kind: "begin_evaluation" }, to: "evaluating" },
       { from: "evaluating", event: { kind: "evaluation_incomplete" }, to: "evaluation_pending" },
+      { from: "substantial_pending", event: { kind: "evaluation_incomplete" }, to: "evaluation_pending" },
       { from: "substantial_pending", event: { kind: "evaluation_completed" }, to: "evaluated" },
       { from: "evaluating", event: { kind: "evaluation_completed" }, to: "evaluated" },
       { from: "evaluated", event: { kind: "substantial" }, to: "substantial_pending" },

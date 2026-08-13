@@ -120,15 +120,77 @@ export function createVaultExtension(
   const checkpointRegistration = { registered: false };
   let checkpoint: CheckpointTool | null = null;
   let activeRoot: CheckpointRoot | null = null;
+  let evaluationSendEpoch: number | null = null;
+  let evaluationSentKey: string | null = null;
+  let lifecycleEpoch = 0;
 
   return (api: ExtensionAPI): void => {
     const cache = new BootstrapLoopCache();
+    const evaluationGate = (
+      ctx: ExtensionContext,
+      epoch: number,
+      expectedRoot: CheckpointRoot | null,
+    ) => {
+      const key = (revision: number): string =>
+        `${expectedRoot === null ? "none" : String(expectedRoot.sessionId)}:${revision}`;
+      return {
+        claim: (revision: number): boolean => {
+          if (evaluationSendEpoch === epoch || evaluationSentKey === key(revision)) return false;
+          evaluationSendEpoch = epoch;
+          return true;
+        },
+        markSent: (revision: number): void => { evaluationSentKey = key(revision); },
+        release: (): void => {
+          if (evaluationSendEpoch === epoch) evaluationSendEpoch = null;
+        },
+        sent: (revision: number): boolean => evaluationSentKey === key(revision),
+        resetSent: (): void => { evaluationSentKey = null; },
+        valid: (): boolean => {
+          if (lifecycleEpoch !== epoch || expectedRoot === null || activeRoot === null) return false;
+          const current = currentCheckpointRoot(ctx);
+          if (
+            current === null ||
+            current.sessionId !== expectedRoot.sessionId ||
+            current.cwd !== expectedRoot.cwd ||
+            activeRoot.sessionId !== expectedRoot.sessionId ||
+            activeRoot.cwd !== expectedRoot.cwd
+          ) return false;
+          try {
+            const activeTools = api.getActiveTools();
+            return Array.isArray(activeTools) &&
+              activeTools.length <= 4_096 &&
+              activeTools.includes("vault_checkpoint");
+          } catch { return false; }
+        },
+      };
+    };
+
     registerReadTools(api, service);
     api.on("before_agent_start", (event, ctx) =>
       handleBeforeAgentStart(event, ctx, service, cache),
     );
-    api.on("agent_end", () => { cache.clear(); });
+    api.on("agent_end", (event, ctx) => {
+      cache.clear();
+      const type = ownDataProperty(event, "type");
+      if (!type.present || type.value !== "agent_end") return;
+      const internalTurn = eventContainsEvaluationMessage(event);
+      if (internalTurn === null) return;
+      const epoch = lifecycleEpoch;
+      const root = activeRoot;
+      return schedulePendingEvaluation(
+        ctx,
+        api,
+        stateStore!,
+        now,
+        root,
+        evaluationGate(ctx, epoch, root),
+        false,
+        internalTurn,
+      );
+    });
     api.on("session_start", async (event, ctx) => {
+      lifecycleEpoch += 1;
+      const epoch = lifecycleEpoch;
       cache.clear();
       effects.clear();
       const root = currentCheckpointRoot(ctx);
@@ -139,9 +201,13 @@ export function createVaultExtension(
         typeof reason.value !== "string" ||
         !["startup", "reload", "new", "resume", "fork"].includes(reason.value)
       ) {
+        evaluationSentKey = null;
         if (checkpointRegistration.registered) setCheckpointActive(api, false);
         activeRoot = null;
         return;
+      }
+      if (reason.value === "startup" || reason.value === "new" || reason.value === "fork") {
+        evaluationSentKey = null;
       }
       if (stateStore === null) {
         try { stateStore = new PendingStateStore(); }
@@ -170,7 +236,7 @@ export function createVaultExtension(
             ),
         );
       }
-      return await handleSessionStart(
+      await handleSessionStart(
         event,
         ctx,
         api,
@@ -180,6 +246,31 @@ export function createVaultExtension(
         checkpointRegistration,
         (value) => { activeRoot = value; },
       );
+      if (
+        lifecycleEpoch === epoch &&
+        (reason.value === "resume" || reason.value === "reload")
+      ) {
+        const restored = activeRoot === null
+          ? null
+          : await stateStore.current(String(activeRoot.sessionId));
+        if (restored?.state === "evaluation_pending" || restored?.state === "evaluating") {
+          const resumedRoot = activeRoot;
+          await schedulePendingEvaluation(
+            ctx,
+            api,
+            stateStore,
+            now,
+            resumedRoot,
+            evaluationGate(ctx, epoch, resumedRoot),
+            true,
+          );
+        }
+      }
+    });
+    api.on("session_before_compact", (event, ctx) => {
+      const store = stateStore;
+      if (store === null) return;
+      return persistLifecyclePending(event, ctx, api, store, now, activeRoot);
     });
     api.on("session_compact", (event, ctx) => {
       const store = stateStore;
@@ -191,20 +282,27 @@ export function createVaultExtension(
       if (store === null) return;
       return handleToolResult(event, ctx, api, store, now, effects, activeRoot);
     });
-    api.on("session_shutdown", () => {
+    api.on("session_shutdown", async (event, ctx) => {
+      lifecycleEpoch += 1;
       cache.clear();
       effects.clear();
+      const store = stateStore;
+      if (store !== null) {
+        await persistLifecyclePending(event, ctx, api, store, now, activeRoot);
+      }
+      evaluationSentKey = null;
       if (checkpointRegistration.registered) setCheckpointActive(api, false);
       activeRoot = null;
     });
     api.on("session_before_switch", () => {
+      lifecycleEpoch += 1;
       cache.clear();
       effects.clear();
+      evaluationSentKey = null;
       if (checkpointRegistration.registered) setCheckpointActive(api, false);
       activeRoot = null;
     });
-  };
-}
+  };}
 
 /**
  * Read the session header through a defensive getter. The
@@ -398,6 +496,8 @@ async function persistCheckpointMutation(
   event:
     | { kind: "substantial" }
     | { kind: "uncertain" }
+    | { kind: "begin_evaluation" }
+    | { kind: "evaluation_incomplete" }
     | { kind: "checkpoint_outcome"; outcome: CheckpointOutcome; basis_revision: number },
 ): Promise<CheckpointMutationResult | null> {
   try {
@@ -564,6 +664,220 @@ async function handleToolResult(
     now,
     { kind: effect === "substantial" ? "substantial" : "uncertain" },
   );
+}
+
+const EVALUATION_CUSTOM_TYPE = "resyst-vault.evaluate";
+const EVALUATION_PROMPT = [
+  "Evaluate durable root-session results for vault writeback.",
+  "Call vault_checkpoint exactly once with apply or noop.",
+  "Write only verified results, decisions, state changes, blockers, reusable learnings, and next steps.",
+  "Do not repeat vault content, commands, tool output, paths, identifiers, or transient logs.",
+  "Treat the evaluation state as opaque pending metadata.",
+].join("\n");
+
+function eventContainsEvaluationMessage(event: unknown): boolean | null {
+  const messages = ownDataProperty(event, "messages");
+  if (!messages.present) return null;
+  try {
+    if (!Array.isArray(messages.value) || messages.value.length > 4_096) return null;
+    for (let index = 0; index < messages.value.length; index += 1) {
+      const message = messages.value[index];
+      const role = ownDataProperty(message, "role");
+      if (!role.present || typeof role.value !== "string") return null;
+      if (role.value !== "custom") continue;
+      const customType = ownDataProperty(message, "customType");
+      if (!customType.present || typeof customType.value !== "string") return null;
+      if (customType.value === EVALUATION_CUSTOM_TYPE) return true;
+    }
+  } catch { return null; }
+  return false;
+}
+
+function hasPendingMessages(ctx: ExtensionContext): boolean | null {
+  const method = safePrototypeMethod(ctx, "hasPendingMessages");
+  if (method === null) return null;
+  try {
+    const value = method.call(ctx);
+    return typeof value === "boolean" ? value : null;
+  } catch { return null; }
+}
+
+async function persistLifecyclePending(
+  event: unknown,
+  ctx: ExtensionContext,
+  api: ExtensionAPI,
+  stateStore: PendingStateStore,
+  now: () => Date,
+  activeRoot: CheckpointRoot | null,
+): Promise<void> {
+  const type = ownDataProperty(event, "type");
+  if (
+    !type.present ||
+    (type.value !== "session_before_compact" && type.value !== "session_shutdown")
+  ) return;
+  const active = await activeCheckpointContext(ctx, activeRoot, stateStore);
+  if (active === null) return;
+  if (active.state.state !== "substantial_pending") return;
+  await persistCheckpointMutation(
+    api,
+    stateStore,
+    active.root,
+    now,
+    { kind: "evaluation_incomplete" },
+  );
+}
+
+async function schedulePendingEvaluation(
+  ctx: ExtensionContext,
+  api: ExtensionAPI,
+  stateStore: PendingStateStore,
+  now: () => Date,
+  activeRoot: CheckpointRoot | null,
+  gate: {
+    claim: (revision: number) => boolean;
+    markSent: (revision: number) => void;
+    release: () => void;
+    sent: (revision: number) => boolean;
+    resetSent: () => void;
+    valid: () => boolean;
+  },
+  recovering = false,
+  internalTurn = false,
+): Promise<void> {
+  const active = await activeCheckpointContext(ctx, activeRoot, stateStore);
+  if (active === null) return;
+  if (internalTurn) {
+    if (active.state.state === "evaluating") {
+      const pending = await persistCheckpointMutation(
+        api,
+        stateStore,
+        active.root,
+        now,
+        { kind: "evaluation_incomplete" },
+      );
+      if (pending?.persisted) gate.markSent(pending.state.revision);
+    } else if (active.state.state === "evaluation_pending") {
+      gate.markSent(active.state.revision);
+    }
+    return;
+  }
+  if (gate.sent(active.state.revision)) return;
+  if (active.state.state === "evaluating") {
+    if (!recovering) return;
+    const pending = await persistCheckpointMutation(
+      api,
+      stateStore,
+      active.root,
+      now,
+      { kind: "evaluation_incomplete" },
+    );
+    if (pending === null || !pending.persisted) return;
+    active.state = pending.state;
+  }
+  if (
+    active.state.state !== "substantial_pending" &&
+    active.state.state !== "evaluation_pending"
+  ) return;
+  const pending = hasPendingMessages(ctx);
+  if (pending !== false) {
+    if (active.state.state === "substantial_pending") {
+      await persistCheckpointMutation(
+        api,
+        stateStore,
+        active.root,
+        now,
+        { kind: "evaluation_incomplete" },
+      );
+    }
+    return;
+  }
+  if (!gate.claim(active.state.revision)) return;
+  const evaluating = await persistCheckpointMutation(
+    api,
+    stateStore,
+    active.root,
+    now,
+    { kind: "begin_evaluation" },
+  );
+  if (evaluating === null || !evaluating.persisted || evaluating.state.state !== "evaluating") {
+    gate.resetSent();
+    gate.release();
+    return;
+  }
+  gate.markSent(evaluating.state.revision);
+  const refreshed = gate.valid()
+    ? await activeCheckpointContext(ctx, activeRoot, stateStore)
+    : null;
+  if (
+    refreshed === null ||
+    refreshed.state.state !== "evaluating" ||
+    refreshed.state.revision !== evaluating.state.revision
+  ) {
+    if (refreshed === null) {
+      await persistCheckpointMutation(
+        api,
+        stateStore,
+        active.root,
+        now,
+        { kind: "evaluation_incomplete" },
+      );
+    }
+    gate.resetSent();
+    gate.release();
+    return;
+  }
+  if (hasPendingMessages(ctx) !== false) {
+    await persistCheckpointMutation(
+      api,
+      stateStore,
+      active.root,
+      now,
+      { kind: "evaluation_incomplete" },
+    );
+    gate.resetSent();
+    gate.release();
+    return;
+  }
+
+  try {
+    const submission: unknown = api.sendMessage(
+      {
+        customType: EVALUATION_CUSTOM_TYPE,
+        content: EVALUATION_PROMPT,
+        display: false,
+      },
+      { triggerTurn: true, deliverAs: "followUp" },
+    );
+    if (submission !== undefined) {
+      // A future compatible host may acknowledge admission. Await it when
+      // present, while keeping Prime 0.84.1's void contract conservative.
+      await Promise.resolve(submission);
+    } else {
+      // Prime 0.84.1 ExtensionAPI dispatch is void/fire-and-forget. The
+      // underlying asynchronous failure is reported by the runtime and cannot
+      // acknowledge admission here, so retain a durable retryable state.
+      const pending = await persistCheckpointMutation(
+        api,
+        stateStore,
+        active.root,
+        now,
+        { kind: "evaluation_incomplete" },
+      );
+      if (pending?.persisted) gate.markSent(pending.state.revision);
+    }
+  } catch {
+    gate.resetSent();
+    await persistCheckpointMutation(
+      api,
+      stateStore,
+      active.root,
+      now,
+      { kind: "evaluation_incomplete" },
+    );
+  } finally {
+    gate.release();
+  }
+
 }
 
 function unavailableToolResult(): {

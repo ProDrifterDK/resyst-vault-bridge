@@ -403,7 +403,9 @@ function stateAfterEvent(
         ? "evaluating"
         : current;
     case "evaluation_incomplete":
-      return current === "evaluating" ? "evaluation_pending" : current;
+      return current === "evaluating" || current === "substantial_pending"
+        ? "evaluation_pending"
+        : current;
     case "evaluation_completed":
       return current === "substantial_pending" ||
         current === "evaluation_pending" ||

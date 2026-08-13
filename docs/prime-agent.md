@@ -131,8 +131,28 @@ replay stale context.
 The bootstrap cache and read tools never write to the vault. An explicit,
 authorized root `vault_checkpoint` is different: it routes normalized apply or
 noop commands through the shared transaction service, immutable journal and
-receipt stores, and machine-local lock/state paths. Automatic evaluation is not
-enabled at this stage.
+receipt stores, and machine-local lock/state paths.
+
+## Automatic missing-checkpoint evaluation
+
+After a substantial authoritative-root turn, the adapter persists `evaluating`
+before enqueueing one hidden `resyst-vault.evaluate` follow-up. The message
+contains fixed bridge-owned criteria and opaque state only; it never repeats
+vault content, tool output, commands, paths, or identifiers. It asks the model
+to call `vault_checkpoint` exactly once with an apply or noop decision.
+
+Queued user work always wins: the adapter records `evaluation_pending` and
+waits for a later idle root boundary. Children never schedule evaluations, and
+bridge tools/internal evaluation do not count as substantial work. Compaction
+and shutdown persist/mirror pending metadata but never start an LLM turn during
+teardown. Resume/reload can request one retry from machine-local pending state.
+Synchronous submission failures and rejected acknowledgements from a future
+compatible host return the record to `evaluation_pending`. Prime 0.84.1's
+`ExtensionAPI.sendMessage` contract is void/fire-and-forget: its underlying
+asynchronous failures are runtime-reported and cannot acknowledge admission to
+the extension. An unacknowledged dispatch is therefore also conservatively
+stored as `evaluation_pending`; an in-memory session/revision claim prevents
+duplicate submission across internal overflow-compaction retries.
 
 ## Privacy and failure modes
 
@@ -180,5 +200,5 @@ enabled at this stage.
   `vault_search` and `vault_read` remain registered and return the fixed
   unavailable result rather than blocking ordinary agent work.
 - Vault writes occur only through an explicit authoritative-root checkpoint
-  and the core transaction service. Automatic missing-checkpoint evaluation
-  remains disabled until the next separately accepted task.
+  and the core transaction service. Automatic evaluation can request that
+  checkpoint after substantial idle root work, but it cannot write directly.
