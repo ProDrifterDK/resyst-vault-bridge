@@ -185,9 +185,19 @@ describe("searchVault", () => {
     expect(corrupt.hits).toHaveLength(1);
   });
 
+  it("indexes large notes within the dedicated search budget", async () => {
+    const { root, config } = await makeConfig();
+    await writeFile(path.join(root, "Large.md"), `# Large\nneedle\n${"x".repeat(1_200_000)}`, "utf8");
+
+    const result = await searchVault({ config, query: "needle", cache: null });
+
+    expect(result.hits.map((hit) => String(hit.path))).toEqual(["Large.md"]);
+    expect(result.hits[0]?.snippet.length).toBeLessThanOrEqual(8_000);
+  });
+
   it("maps hostile or oversized vault input to one fixed redacted search error", async () => {
     const { root, config } = await makeConfig();
-    await writeFile(path.join(root, "Huge.md"), `# Huge\nneedle\n${"x".repeat(600_000)}`, "utf8");
+    await writeFile(path.join(root, "Huge.md"), `# Huge\nneedle\n${"x".repeat(2_100_000)}`, "utf8");
 
     await expect(searchVault({ config, query: "needle", cache: null })).rejects.toMatchObject({
       name: "SearchError",

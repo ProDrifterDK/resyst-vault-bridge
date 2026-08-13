@@ -19,6 +19,7 @@ import { parseSearchHit } from "./schemas.js";
 import type { SearchHit } from "./types.js";
 
 export const MAX_NOTE_BYTES = 512 * 1024;
+export const MAX_INDEX_NOTE_BYTES = 2 * 1024 * 1024;
 export const MAX_INDEX_BYTES = 64 * 1024 * 1024;
 export const MAX_SEARCH_HITS = 32;
 export const MAX_SNIPPET_CHARS = 8_000;
@@ -366,7 +367,7 @@ function parseCachedIndex(value: unknown): CachedIndex | null {
         Object.keys(note).length !== 10 ||
         typeof note.path !== "string" || note.path.length > 1_024 ||
         typeof note.source !== "string" ||
-        Buffer.byteLength(note.source, "utf8") > MAX_NOTE_BYTES ||
+        Buffer.byteLength(note.source, "utf8") > MAX_INDEX_NOTE_BYTES ||
         typeof note.filename !== "string" || note.filename.length > 1_024 ||
         typeof note.title !== "string" || note.title.length > 1_024 ||
         !isBoundedStringArray(note.aliases, 64) ||
@@ -476,7 +477,7 @@ async function listVaultNotes(
         throw error;
       }
       const fileStat = await fs.stat(resolved.absolute);
-      if (fileStat.size > BigInt(MAX_NOTE_BYTES)) {
+      if (fileStat.size > BigInt(MAX_INDEX_NOTE_BYTES)) {
         throw new Error("note byte budget exceeded");
       }
       indexedBytes += fileStat.size;
@@ -498,7 +499,7 @@ async function listVaultNotes(
 
 function deriveIndexedNote(file: NoteFile, source: string): IndexedNote | null {
   if (source.includes("\u0000")) return null;
-  if (Buffer.byteLength(source, "utf8") > MAX_NOTE_BYTES) {
+  if (Buffer.byteLength(source, "utf8") > MAX_INDEX_NOTE_BYTES) {
     throw new Error("vault note exceeds byte budget");
   }
   const parsed = parseNote(source);
@@ -564,7 +565,7 @@ async function indexNote(
     before.size.toString() !== file.size ||
     !before.isFile()
   ) throw new Error("vault note changed during indexing");
-  const source = await fs.readFileBounded(resolved.absolute, MAX_NOTE_BYTES);
+  const source = await fs.readFileBounded(resolved.absolute, MAX_INDEX_NOTE_BYTES);
   const after = await fs.stat(resolved.absolute);
   if (
     after.dev !== before.dev || after.ino !== before.ino ||

@@ -135,6 +135,26 @@ describe("readVaultNote", () => {
     expect(result.content).not.toMatch(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u);
   });
 
+  it("keeps the direct-read ceiling below the search indexing ceiling", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "resyst-split-limit-"));
+    temporaryDirectories.push(root);
+    const vault = await createVault({ vaultPath: root });
+    await vault.writeNote("Large.md", `# Large
+searchable split needle
+${"x".repeat(600_000)}`);
+    const config = await fixtureConfig(root);
+    const { searchVault } = await import("../../src/search.js");
+
+    const search = await searchVault({ config, query: "searchable split needle", cache: null });
+
+    expect(search.hits.map((hit) => String(hit.path))).toEqual(["Large.md"]);
+    expect(search.hits[0]?.snippet.length).toBeLessThanOrEqual(8_000);
+    await expect(readVaultNote({ config, path: "Large.md" })).rejects.toMatchObject({
+      name: "VaultReadError",
+      code: "note_unreadable",
+    });
+  });
+
   it("allows explicit attachment Markdown reads while automatic search excludes attachments", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "resyst-explicit-attachment-"));
     temporaryDirectories.push(root);
