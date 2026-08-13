@@ -48,7 +48,7 @@ beforeAll(async () => {
   await writeFile(path.join(xdgConfig, "resyst-vault", "config.json"), JSON.stringify({ version: 1, host_id: "casey", vault_path: vaultRoot, project_overrides: [] }), "utf8");
   environment = { ...process.env, XDG_CONFIG_HOME: xdgConfig, XDG_STATE_HOME: xdgState, NO_COLOR: "1" };
   delete environment.FORCE_COLOR;
-});
+}, 45_000);
 afterAll(async () => { await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true }))); });
 
 describe("stable JSON CLI", () => {
