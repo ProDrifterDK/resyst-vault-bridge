@@ -31,20 +31,20 @@ export const BOOTSTRAP_DATA_INSTRUCTION = "The block below is a single JSON-enco
  * triggers `before_agent_start`.
  */
 export function createVaultExtension(options = {}) {
-    const service = options.service ?? createProductionService();
-    let checkpointService = options.checkpointService ?? null;
-    let stateStore = options.checkpointStateStore ?? null;
-    const now = options.now ?? (() => new Date());
-    const effects = new EffectTracker({
-        ...(options.substantialTools === undefined ? {} : { substantialTools: options.substantialTools }),
-    });
-    const checkpointRegistration = { registered: false };
-    let checkpoint = null;
-    let activeRoot = null;
-    let evaluationSendEpoch = null;
-    let evaluationSentKey = null;
-    let lifecycleEpoch = 0;
     return (api) => {
+        const service = options.service ?? createProductionService();
+        let checkpointService = options.checkpointService ?? null;
+        let stateStore = options.checkpointStateStore ?? null;
+        const now = options.now ?? (() => new Date());
+        const effects = new EffectTracker({
+            ...(options.substantialTools === undefined ? {} : { substantialTools: options.substantialTools }),
+        });
+        const checkpointRegistration = { registered: false };
+        let checkpoint = null;
+        let activeRoot = null;
+        let evaluationSendEpoch = null;
+        let evaluationSentKey = null;
+        let lifecycleEpoch = 0;
         const cache = new BootstrapLoopCache();
         const evaluationGate = (ctx, epoch, expectedRoot) => {
             const key = (revision) => `${expectedRoot === null ? "none" : String(expectedRoot.sessionId)}:${revision}`;

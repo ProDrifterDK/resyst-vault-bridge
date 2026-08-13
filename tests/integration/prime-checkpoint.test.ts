@@ -185,6 +185,62 @@ describe("Prime root checkpoint integration", () => {
     }
   });
 
+  it("keeps the root checkpoint authoritative after the same factory starts a child", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "resyst-prime-checkpoint-isolation-"));
+    try {
+      const run = vi.fn(async () => ({ outcome: "noop" as const }));
+      const store = new PendingStateStore({ stateRoot: root });
+      const factory = createVaultExtension({
+        service: fakeReadService(),
+        checkpointService: { checkpoint: run },
+        checkpointStateStore: store,
+        now: () => new Date("2026-08-13T00:00:00.000Z"),
+      });
+      const rootHarness = harness();
+      const childHarness = harness();
+      factory(rootHarness.api);
+      factory(childHarness.api);
+
+      const rootCtx = context({ id: "session-atlas", rlmDepth: 0 });
+      await emit(rootHarness, "session_start", { type: "session_start", reason: "startup" }, rootCtx);
+      expect(rootHarness.api.getActiveTools()).toContain("vault_checkpoint");
+
+      await emit(
+        childHarness,
+        "session_start",
+        { type: "session_start", reason: "startup" },
+        context({ id: "session-child", rlmDepth: 1 }),
+      );
+      expect(childHarness.tools.some((tool) => tool.name === "vault_checkpoint")).toBe(false);
+
+      await emit(rootHarness, "tool_result", {
+        type: "tool_result",
+        toolCallId: "edit-after-child",
+        toolName: "edit",
+        input: { path: "src/app.ts" },
+        content: [],
+        details: {},
+        isError: false,
+      }, rootCtx);
+      expect(rootHarness.appendEntry).toHaveBeenLastCalledWith(
+        CHECKPOINT_STATE_CUSTOM_TYPE,
+        expect.objectContaining({ state: "substantial_pending" }),
+      );
+
+      const result = await checkpointTool(rootHarness).execute(
+        "checkpoint-after-child",
+        noopCommand(),
+        undefined,
+        undefined,
+        rootCtx,
+      );
+      expect(run).toHaveBeenCalledOnce();
+      expect(result.content).toEqual([{ type: "text", text: "vault checkpoint: noop" }]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("tracks substantial effects and persists one evaluated noop marker plus one-line receipt", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "resyst-prime-checkpoint-noop-"));
     try {
