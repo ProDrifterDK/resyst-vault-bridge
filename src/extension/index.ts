@@ -110,21 +110,20 @@ export const BOOTSTRAP_DATA_INSTRUCTION =
 export function createVaultExtension(
   options: CreateVaultExtensionOptions = {},
 ): (api: ExtensionAPI) => void {
-  const service = options.service ?? createProductionService();
-  let checkpointService: CheckpointService | null = options.checkpointService ?? null;
-  let stateStore: PendingStateStore | null = options.checkpointStateStore ?? null;
-  const now = options.now ?? (() => new Date());
-  const effects = new EffectTracker({
-    ...(options.substantialTools === undefined ? {} : { substantialTools: options.substantialTools }),
-  });
-  const checkpointRegistration = { registered: false };
-  let checkpoint: CheckpointTool | null = null;
-  let activeRoot: CheckpointRoot | null = null;
-  let evaluationSendEpoch: number | null = null;
-  let evaluationSentKey: string | null = null;
-  let lifecycleEpoch = 0;
-
   return (api: ExtensionAPI): void => {
+    const service = options.service ?? createProductionService();
+    let checkpointService: CheckpointService | null = options.checkpointService ?? null;
+    let stateStore: PendingStateStore | null = options.checkpointStateStore ?? null;
+    const now = options.now ?? (() => new Date());
+    const effects = new EffectTracker({
+      ...(options.substantialTools === undefined ? {} : { substantialTools: options.substantialTools }),
+    });
+    const checkpointRegistration = { registered: false };
+    let checkpoint: CheckpointTool | null = null;
+    let activeRoot: CheckpointRoot | null = null;
+    let evaluationSendEpoch: number | null = null;
+    let evaluationSentKey: string | null = null;
+    let lifecycleEpoch = 0;
     const cache = new BootstrapLoopCache();
     const evaluationGate = (
       ctx: ExtensionContext,
