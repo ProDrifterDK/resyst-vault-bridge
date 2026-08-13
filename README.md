@@ -34,7 +34,7 @@ Implemented: configuration and containment, bounded snapshots, bootstrap,
 resolution, read/search, rendering, transactional apply/recovery/rollback, the
 JSON CLI, Prime bootstrap/read/checkpoint integration, and automatic
 missing-checkpoint evaluation, CI, and public-repository privacy gates. The
-final synthetic canary and compatibility smoke remain release gates.
+final synthetic canary and offline Prime compatibility smoke are implemented and remain mandatory release gates.
 
 The package stays `private: true` until a license and release policy are chosen.
 Git installation is the current canary path; this is not an npm release.
@@ -42,10 +42,10 @@ Git installation is the current canary path; this is not an npm release.
 ## Install from Git for synthetic testing
 
 ```bash
-npm install 'git+https://github.com/ProDrifterDK/resyst-vault-bridge.git'
+pi package install git:github.com/ProDrifterDK/resyst-vault-bridge
 ```
 
-Prime Agent discovers the tracked TypeScript extension entry. See
+Prime Agent installs dependencies and loads the tracked built extension entry. The adapter requires a host that persists a safe integer `SessionHeader.rlmDepth`; Prime Agent v0.7.2 is the pinned full-authority canary. Hosts without that capability remain read-only and receive no automatic bootstrap. See
 [`docs/prime-agent.md`](docs/prime-agent.md) for adapter setup.
 
 ## Synthetic CLI examples
@@ -62,6 +62,12 @@ resyst-vault status --no-color
 
 Commands emit bounded one-line JSON or JSON Lines. Diagnostics are redacted.
 Use `resyst-vault --help` for the exact grammar.
+
+## Validation and rollout
+
+The final synthetic canary, pinned Prime Agent Git-package smoke, legacy fail-closed probe, and the
+manual safety sequence are documented in [`docs/runbook.md`](docs/runbook.md).
+The runbook does not authorize production writeback.
 
 ## Non-goals
 
@@ -97,8 +103,7 @@ npm run check
 ```
 
 `npm run check` runs strict type checking, lint, the explicit-`any` gate, all
-unit/integration/privacy tests, the production build, and the artifact manifest
-check.
+unit/integration/privacy tests, the production build, a reproducible Prime v0.7.2 host build and offline package-install smoke, the legacy fail-closed probe, and the artifact manifest check. The first compatibility run fetches immutable Prime commit `83a0f9f9566219551fcb6ffaf7f519a815749a58` and npm dependencies into a disposable local cache; the package-install and extension exercise then run with network proxies disabled.
 
 ## License
 

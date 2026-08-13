@@ -147,6 +147,19 @@ try {
 		readFileSync(path.join(root, "package.json"), "utf8"),
 	);
 	if (packageMetadata.private !== true) fail();
+	if (packageMetadata.peerDependencies !== undefined) fail();
+	if (packageMetadata.engines?.node !== ">=22.19.0") fail();
+	if (
+		JSON.stringify(packageMetadata.pi?.extensions) !==
+		JSON.stringify(["./dist/extension/index.js"])
+	)
+		fail();
+	if (packageMetadata.bin?.["resyst-vault"] !== "./dist/cli.js") fail();
+	if (
+		!files.includes("dist/extension/index.js") ||
+		!files.includes("dist/cli.js")
+	)
+		fail();
 	if (
 		JSON.stringify(packageMetadata.files) !==
 		JSON.stringify(["dist/", "docs/", "README.md"])

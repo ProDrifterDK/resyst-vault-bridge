@@ -98,8 +98,10 @@ function unsafeTrackedPath(file: string): boolean {
 	if (PRIVATE_PATH_SEGMENT.test(file)) return true;
 	const productSource = new Set([
 		"src/journal.ts",
+		"dist/journal.js",
 		"tests/unit/journal.test.ts",
 		"src/rollback.ts",
+		"dist/rollback.js",
 		"tests/integration/rollback.test.ts",
 	]);
 	return (
@@ -246,12 +248,14 @@ function generateFixtureManifest(blobs: TrackedBlob[]): FixtureManifest {
 	return {
 		version: 1,
 		people: [
-			...decodedCorpus.matchAll(
-				/^(?:- )?Name:\s*([A-Za-z][A-Za-z -]{0,63})$/gmu,
+			...new Set(
+				[
+					...decodedCorpus.matchAll(
+						/^(?:- )?Name:\s*([A-Za-z][A-Za-z -]{0,63})$/gmu,
+					),
+				].map((match) => match[1]!),
 			),
-		]
-			.map((match) => match[1]!)
-			.sort(),
+		].sort(),
 		projects: [
 			...[...fixture.matchAll(/^- \[\[([^\]\r\n]{1,128})\]\]$/gmu)]
 				.map((match) => match[1]!)
@@ -365,7 +369,12 @@ describe("public repository hygiene", () => {
 		expect(published.people).toEqual(["Casey"]);
 		expect(published.projects).toEqual(["Alpha", "Atlas", "Launchpad", "x"]);
 		expect(published.remotes).toEqual(
-			["github.com/tester/atlas", "github.com/upstream/atlas"].sort(),
+			[
+				"github.com/PrimeIntellect-ai/prime-agent",
+				"github.com/tester/atlas",
+				"github.com/upstream/atlas",
+				"offline.invalid/resyst/vault",
+			].sort(),
 		);
 		expect(published.roots).toEqual([
 			"/home/tester",

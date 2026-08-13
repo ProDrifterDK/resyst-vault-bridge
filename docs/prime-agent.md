@@ -9,17 +9,16 @@ sessions never keep it active.
 
 ## Installation
 
-Prime Agent loads extensions from Git packages. This adapter requires Prime
-Agent `>=0.84.1`; that floor covers execute-time context, lifecycle events,
-sequential custom tools, active-tool updates, and immediate late registration.
+Prime Agent loads extensions from Git packages. Full root behavior requires an authenticated host capability: a persisted safe-integer `SessionHeader.rlmDepth` that round-trips through `SessionManager.newSession`. The release gate pins Prime Agent v0.7.2 at immutable commit `83a0f9f9566219551fcb6ffaf7f519a815749a58`, which includes that contract. The legacy npm SDK 0.84.1 supplies the compile-time API baseline but does not persist depth; it is tested only to fail closed with read tools, no bootstrap, and no checkpoint authority.
+
 Install the bridge from this repository:
 
-```text
-git:github.com/ProDrifterDK/resyst-vault-bridge
+```bash
+pi package install git:github.com/ProDrifterDK/resyst-vault-bridge
 ```
 
 Once installed, Prime Agent discovers the extension through the package's
-`pi.extensions` manifest and loads `./src/extension/index.ts`. Importing
+`pi.extensions` manifest and loads `./dist/extension/index.js`. The built entry is tracked so a clean Git clone is immediately loadable after dependency installation. Importing
 the module does not eagerly load any vault configuration; the bridge
 performs no filesystem read at import or registration. Mutation modules and
 machine-local checkpoint state are loaded lazily only after a validated root
