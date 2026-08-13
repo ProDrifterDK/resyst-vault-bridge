@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
 import {
+	copyFile,
 	mkdtemp,
 	mkdir,
 	readFile,
@@ -199,6 +200,10 @@ try {
 	const tarball = path.join(packDir, packed[0].filename);
 	await mkdir(sourceRepo, { recursive: true });
 	await run("tar", ["-xzf", tarball, "--strip-components=1", "-C", sourceRepo]);
+	await copyFile(
+		path.join(project, "package-lock.json"),
+		path.join(sourceRepo, "package-lock.json"),
+	);
 	assert.equal(
 		JSON.parse(await readFile(path.join(sourceRepo, "package.json"), "utf8")).pi
 			.extensions[0],
@@ -234,7 +239,7 @@ import { appendFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 appendFileSync(${JSON.stringify(wrapperLog)}, process.argv.slice(2).join(" ") + "\\n");
 if (process.argv.slice(2).join(" ") !== "install") process.exit(9);
-const result = spawnSync("npm", ["install", "--offline", "--ignore-scripts", "--omit=dev", "--no-audit", "--no-fund"], { cwd: process.cwd(), stdio: "inherit", env: process.env });
+const result = spawnSync("npm", ["ci", "--offline", "--ignore-scripts", "--omit=dev", "--no-audit", "--no-fund"], { cwd: process.cwd(), stdio: "inherit", env: process.env });
 process.exit(result.status ?? 8);
 `,
 		"utf8",
