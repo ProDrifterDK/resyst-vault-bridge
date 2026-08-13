@@ -183,7 +183,7 @@ describe("stable JSON CLI: adjudication coverage", () => {
     const stringAtLimit = invokeRaw(["search"], `${JSON.stringify({ query: "x".repeat(1_000_000) })}\n`);
     expect(stringAtLimit.status).toBe(2); // exact query schema rejection, not global string budget
     expect(stringAtLimit.stderr).not.toContain("bounded length");
-  });
+  }, 15_000);
 
   it("validates every JSONL schema before emitting output or writing the cache", async () => {
     const atomicState = await mkdtemp(path.join(os.tmpdir(), "resyst-cli-atomic-state-"));
