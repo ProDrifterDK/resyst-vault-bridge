@@ -94,6 +94,8 @@ export function createVaultExtension(options = {}) {
             const internalTurn = eventContainsEvaluationMessage(event);
             if (internalTurn === null)
                 return;
+            if (!internalTurn && !eventEndsWithTerminalAssistantStop(event))
+                return;
             const epoch = lifecycleEpoch;
             const root = activeRoot;
             return schedulePendingEvaluation(ctx, api, stateStore, now, root, evaluationGate(ctx, epoch, root), false, internalTurn);
@@ -518,6 +520,9 @@ const EVALUATION_CUSTOM_TYPE = "resyst-vault.evaluate";
 const EVALUATION_PROMPT = [
     "Evaluate durable root-session results for vault writeback.",
     "Call vault_checkpoint exactly once with apply or noop.",
+    "A checkpoint receipt is bookkeeping, not proof that the root task is complete.",
+    "After the checkpoint, resume prior unfinished actionable work in the same turn.",
+    "Stop only when prior work was already complete, explicitly paused, or blocked awaiting external input.",
     "Write only verified results, decisions, state changes, blockers, reusable learnings, and next steps.",
     "Do not repeat vault content, commands, tool output, paths, identifiers, or transient logs.",
     "Treat the evaluation state as opaque pending metadata.",
@@ -545,6 +550,29 @@ function eventContainsEvaluationMessage(event) {
     }
     catch {
         return null;
+    }
+    return false;
+}
+function eventEndsWithTerminalAssistantStop(event) {
+    const messages = ownDataProperty(event, "messages");
+    if (!messages.present)
+        return false;
+    try {
+        if (!Array.isArray(messages.value) || messages.value.length > 4_096)
+            return false;
+        for (let index = messages.value.length - 1; index >= 0; index -= 1) {
+            const message = messages.value[index];
+            const role = ownDataProperty(message, "role");
+            if (!role.present || typeof role.value !== "string")
+                return false;
+            if (role.value !== "assistant")
+                continue;
+            const stopReason = ownDataProperty(message, "stopReason");
+            return stopReason.present && stopReason.value === "stop";
+        }
+    }
+    catch {
+        return false;
     }
     return false;
 }

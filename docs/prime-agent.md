@@ -135,10 +135,19 @@ receipt stores, and machine-local lock/state paths.
 ## Automatic missing-checkpoint evaluation
 
 After a substantial authoritative-root turn, the adapter persists `evaluating`
-before enqueueing one hidden `resyst-vault.evaluate` follow-up. The message
-contains fixed bridge-owned criteria and opaque state only; it never repeats
-vault content, tool output, commands, paths, or identifiers. It asks the model
-to call `vault_checkpoint` exactly once with an apply or noop decision.
+before enqueueing one hidden `resyst-vault.evaluate` follow-up. Automatic
+evaluation is admitted only when the last assistant message proves a terminal
+`stop` boundary. Tool-use, error, abort, length, unknown, malformed, oversized,
+and assistant-free endings keep evaluation pending so host compaction, retry,
+or continuation work cannot be displaced.
+
+The message contains fixed bridge-owned criteria and opaque state only; it never
+repeats vault content, tool output, commands, paths, or identifiers. It asks the
+model to call `vault_checkpoint` exactly once with an apply or noop decision,
+treat the receipt as bookkeeping rather than task completion, and then resume
+prior unfinished actionable work in the same turn. It stops after checkpoint
+bookkeeping only when the prior task was complete, explicitly paused, or blocked
+awaiting external input.
 
 Queued user work always wins: the adapter records `evaluation_pending` and
 waits for a later idle root boundary. Children never schedule evaluations, and
