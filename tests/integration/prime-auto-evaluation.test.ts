@@ -108,11 +108,18 @@ function checkpointTool(fixture: Harness): ToolDefinition {
   return tool;
 }
 
+function terminalMessages(): unknown[] {
+  return [{ role: "assistant", content: [], stopReason: "stop" }];
+}
+
 const EXPECTED_EVALUATION_MESSAGE = {
   customType: "resyst-vault.evaluate",
   content: [
     "Evaluate durable root-session results for vault writeback.",
     "Call vault_checkpoint exactly once with apply or noop.",
+    "A checkpoint receipt is bookkeeping, not proof that the root task is complete.",
+    "After the checkpoint, resume prior unfinished actionable work in the same turn.",
+    "Stop only when prior work was already complete, explicitly paused, or blocked awaiting external input.",
     "Write only verified results, decisions, state changes, blockers, reusable learnings, and next steps.",
     "Do not repeat vault content, commands, tool output, paths, identifiers, or transient logs.",
     "Treat the evaluation state as opaque pending metadata.",
@@ -134,7 +141,7 @@ describe("Prime automatic missing-checkpoint evaluation", () => {
           type: "tool_result", toolCallId: `bridge-${index}`, toolName, input: {}, isError: false,
         }, ctx);
       }
-      await emit(fixture, "agent_end", { type: "agent_end", messages: [] }, ctx);
+      await emit(fixture, "agent_end", { type: "agent_end", messages: terminalMessages() }, ctx);
       expect(fixture.sendMessage).not.toHaveBeenCalled();
       expect(await store.load("session-atlas")).toMatchObject({ state: "clean" });
     } finally { await rm(root, { recursive: true, force: true }); }
@@ -149,7 +156,7 @@ describe("Prime automatic missing-checkpoint evaluation", () => {
       const ctx = context({ id: "session-atlas", rlmDepth: 0 });
       await startRoot(fixture, ctx);
       await substantial(fixture, ctx);
-      await emit(fixture, "agent_end", { type: "agent_end", messages: [] }, ctx);
+      await emit(fixture, "agent_end", { type: "agent_end", messages: terminalMessages() }, ctx);
       expect(fixture.sendMessage).toHaveBeenCalledTimes(1);
       expect(fixture.sendMessage).toHaveBeenCalledWith(
         EXPECTED_EVALUATION_MESSAGE,
@@ -166,6 +173,77 @@ describe("Prime automatic missing-checkpoint evaluation", () => {
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
+  it("defers evaluation across a compaction-interrupted tool-use boundary", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "resyst-auto-compaction-continuation-"));
+    try {
+      const fixture = harness();
+      const store = new PendingStateStore({ stateRoot: root });
+      install(fixture, store);
+      const ctx = context({ id: "session-atlas", rlmDepth: 0 });
+      await startRoot(fixture, ctx);
+      await substantial(fixture, ctx);
+
+      await emit(fixture, "agent_end", {
+        type: "agent_end",
+        messages: [{
+          role: "assistant",
+          content: [{ type: "toolCall", id: "call-1", name: "edit", arguments: {} }],
+          stopReason: "toolUse",
+        }],
+      }, ctx);
+      expect(fixture.sendMessage).not.toHaveBeenCalled();
+      expect(await store.load("session-atlas")).toMatchObject({ state: "substantial_pending" });
+
+      await emit(fixture, "session_before_compact", {
+        type: "session_before_compact", preparation: {}, branchEntries: [], signal: new AbortController().signal,
+      }, ctx);
+      await emit(fixture, "session_compact", {
+        type: "session_compact", reason: "threshold", summary: "opaque",
+      }, ctx);
+      expect(fixture.sendMessage).not.toHaveBeenCalled();
+      expect(await store.load("session-atlas")).toMatchObject({ state: "evaluation_pending" });
+
+      await emit(fixture, "agent_end", {
+        type: "agent_end",
+        messages: [{ role: "assistant", content: [], stopReason: "stop" }],
+      }, ctx);
+      expect(fixture.sendMessage).toHaveBeenCalledTimes(1);
+      expect(fixture.sendMessage).toHaveBeenCalledWith(
+        EXPECTED_EVALUATION_MESSAGE,
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("defers nonterminal and unprovable agent boundaries", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "resyst-auto-nonterminal-boundaries-"));
+    try {
+      const fixture = harness();
+      const store = new PendingStateStore({ stateRoot: root });
+      install(fixture, store);
+      const ctx = context({ id: "session-atlas", rlmDepth: 0 });
+      await startRoot(fixture, ctx);
+      await substantial(fixture, ctx);
+
+      const cases: unknown[][] = [
+        [{ role: "assistant", content: [], stopReason: "error" }],
+        [{ role: "assistant", content: [], stopReason: "aborted" }],
+        [{ role: "assistant", content: [], stopReason: "length" }],
+        [{ role: "assistant", content: [], stopReason: "future-reason" }],
+        [{ role: "assistant", content: [] }],
+        [{ role: "user", content: "opaque" }],
+        [{ content: [] }],
+        Array.from({ length: 4_097 }, () => ({ role: "user", content: "opaque" })),
+      ];
+      for (const messages of cases) {
+        await emit(fixture, "agent_end", { type: "agent_end", messages }, ctx);
+      }
+
+      expect(fixture.sendMessage).not.toHaveBeenCalled();
+      expect(await store.load("session-atlas")).toMatchObject({ state: "substantial_pending" });
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it("coalesces concurrent idle boundaries to one hidden evaluation send", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "resyst-auto-concurrent-"));
     try {
@@ -178,8 +256,8 @@ describe("Prime automatic missing-checkpoint evaluation", () => {
       const ctx = context({ id: "session-atlas", rlmDepth: 0 });
       await startRoot(fixture, ctx);
       await substantial(fixture, ctx);
-      const first = emit(fixture, "agent_end", { type: "agent_end", messages: [] }, ctx);
-      const second = emit(fixture, "agent_end", { type: "agent_end", messages: [] }, ctx);
+      const first = emit(fixture, "agent_end", { type: "agent_end", messages: terminalMessages() }, ctx);
+      const second = emit(fixture, "agent_end", { type: "agent_end", messages: terminalMessages() }, ctx);
       await vi.waitFor(() => expect(fixture.sendMessage).toHaveBeenCalledTimes(1));
       expect(fixture.sendMessage).toHaveBeenCalledTimes(1);
       release?.();
@@ -197,7 +275,7 @@ describe("Prime automatic missing-checkpoint evaluation", () => {
       const ctx = context({ id: "session-atlas", rlmDepth: 0 });
       await startRoot(fixture, ctx);
       await substantial(fixture, ctx, "edit-1");
-      await emit(fixture, "agent_end", { type: "agent_end", messages: [] }, ctx);
+      await emit(fixture, "agent_end", { type: "agent_end", messages: terminalMessages() }, ctx);
       await checkpointTool(fixture).execute(
         "checkpoint-1",
         { version: 1, kind: "noop", reason: "no_new_knowledge" },
@@ -210,7 +288,7 @@ describe("Prime automatic missing-checkpoint evaluation", () => {
         messages: [{ role: "custom", customType: "resyst-vault.evaluate", content: "opaque", display: false }],
       }, ctx);
       await substantial(fixture, ctx, "edit-2");
-      await emit(fixture, "agent_end", { type: "agent_end", messages: [] }, ctx);
+      await emit(fixture, "agent_end", { type: "agent_end", messages: terminalMessages() }, ctx);
       expect(fixture.sendMessage).toHaveBeenCalledTimes(2);
       expect(await store.load("session-atlas")).toMatchObject({ state: "evaluating" });
     } finally { await rm(root, { recursive: true, force: true }); }
@@ -239,7 +317,7 @@ describe("Prime automatic missing-checkpoint evaluation", () => {
         }
         return await originalCurrent(sessionId);
       });
-      const ending = emit(fixture, "agent_end", { type: "agent_end", messages: [] }, ctx);
+      const ending = emit(fixture, "agent_end", { type: "agent_end", messages: terminalMessages() }, ctx);
       await entered;
       await checkpointTool(fixture).execute(
         "checkpoint-race",
@@ -264,7 +342,7 @@ describe("Prime automatic missing-checkpoint evaluation", () => {
       const ctx = context({ id: "session-atlas", rlmDepth: 0 });
       await startRoot(fixture, ctx);
       await substantial(fixture, ctx);
-      await emit(fixture, "agent_end", { type: "agent_end", messages: [] }, ctx);
+      await emit(fixture, "agent_end", { type: "agent_end", messages: terminalMessages() }, ctx);
       await emit(fixture, "agent_end", {
         type: "agent_end",
         messages: [
@@ -304,7 +382,7 @@ describe("Prime automatic missing-checkpoint evaluation", () => {
         undefined,
         ctx,
       );
-      await emit(fixture, "agent_end", { type: "agent_end", messages: [] }, ctx);
+      await emit(fixture, "agent_end", { type: "agent_end", messages: terminalMessages() }, ctx);
       expect(fixture.sendMessage).not.toHaveBeenCalled();
       expect(await store.load("session-atlas")).toMatchObject({ state: "evaluated" });
     } finally { await rm(root, { recursive: true, force: true }); }
@@ -319,12 +397,12 @@ describe("Prime automatic missing-checkpoint evaluation", () => {
       const queued = context({ id: "session-atlas", rlmDepth: 0 }, { pending: true });
       await startRoot(fixture, queued);
       await substantial(fixture, queued);
-      await emit(fixture, "agent_end", { type: "agent_end", messages: [] }, queued);
+      await emit(fixture, "agent_end", { type: "agent_end", messages: terminalMessages() }, queued);
       expect(fixture.sendMessage).not.toHaveBeenCalled();
       expect(await store.load("session-atlas")).toMatchObject({ state: "evaluation_pending" });
 
       const idle = context({ id: "session-atlas", rlmDepth: 0 });
-      await emit(fixture, "agent_end", { type: "agent_end", messages: [] }, idle);
+      await emit(fixture, "agent_end", { type: "agent_end", messages: terminalMessages() }, idle);
       expect(fixture.sendMessage).toHaveBeenCalledTimes(1);
       expect(await store.load("session-atlas")).toMatchObject({ state: "evaluating" });
     } finally { await rm(root, { recursive: true, force: true }); }
@@ -378,7 +456,7 @@ describe("Prime automatic missing-checkpoint evaluation", () => {
       await emit(
         child,
         "agent_end",
-        { type: "agent_end", messages: [] },
+        { type: "agent_end", messages: terminalMessages() },
         context({ id: "session-child", rlmDepth: 1 }),
       );
       expect(child.sendMessage).not.toHaveBeenCalled();
@@ -394,7 +472,7 @@ describe("Prime automatic missing-checkpoint evaluation", () => {
       const ctx = context({ id: "session-atlas", rlmDepth: 0 });
       await startRoot(fixture, ctx);
       await substantial(fixture, ctx);
-      await emit(fixture, "agent_end", { type: "agent_end", messages: [] }, ctx);
+      await emit(fixture, "agent_end", { type: "agent_end", messages: terminalMessages() }, ctx);
       fixture.sendMessage.mockClear();
 
       await emit(fixture, "session_before_compact", {
@@ -439,7 +517,7 @@ describe("Prime automatic missing-checkpoint evaluation", () => {
       const ctx = context({ id: "session-atlas", rlmDepth: 0 });
       await startRoot(fixture, ctx);
       await substantial(fixture, ctx);
-      await emit(fixture, "agent_end", { type: "agent_end", messages: [] }, ctx);
+      await emit(fixture, "agent_end", { type: "agent_end", messages: terminalMessages() }, ctx);
       expect(fixture.sendMessage).toHaveBeenCalledTimes(1);
       expect(await store.load("session-atlas")).toMatchObject({ state: "evaluation_pending" });
       await emit(fixture, "session_start", { type: "session_start", reason: "reload" }, ctx);
@@ -466,7 +544,7 @@ describe("Prime automatic missing-checkpoint evaluation", () => {
         await blocked;
         return await originalCurrent(sessionId);
       });
-      const ending = emit(fixture, "agent_end", { type: "agent_end", messages: [] }, ctx);
+      const ending = emit(fixture, "agent_end", { type: "agent_end", messages: terminalMessages() }, ctx);
       await entered;
       await emit(fixture, "session_before_switch", { type: "session_before_switch" }, ctx);
       release?.();
@@ -494,7 +572,7 @@ describe("Prime automatic missing-checkpoint evaluation", () => {
       }, ctx)).resolves.toBeDefined();
       expect(fixture.sendMessage).not.toHaveBeenCalled();
       expect(await store.load("session-atlas")).toMatchObject({ state: "substantial_pending" });
-      await emit(fixture, "agent_end", { type: "agent_end", messages: [] }, ctx);
+      await emit(fixture, "agent_end", { type: "agent_end", messages: terminalMessages() }, ctx);
       expect(fixture.sendMessage).toHaveBeenCalledTimes(1);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
@@ -510,7 +588,7 @@ describe("Prime automatic missing-checkpoint evaluation", () => {
       await startRoot(fixture, ctx);
       await substantial(fixture, ctx);
       await expect(
-        emit(fixture, "agent_end", { type: "agent_end", messages: [] }, ctx),
+        emit(fixture, "agent_end", { type: "agent_end", messages: terminalMessages() }, ctx),
       ).resolves.toBeDefined();
       expect(await store.load("session-atlas")).toMatchObject({ state: "evaluation_pending" });
       expect(fixture.sendMessage).toHaveBeenCalledTimes(1);
