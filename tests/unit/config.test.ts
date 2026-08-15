@@ -13,6 +13,7 @@ import {
   ConfigError,
   DEFAULT_CONTEXT_BUDGET_TOKENS,
   loadConfig,
+  loadLocalConfig,
   MAX_CONFIG_BYTES,
   nodeConfigFs,
   parseLocalConfig,
@@ -104,6 +105,59 @@ function validLocalConfig(): Record<string, unknown> {
     vault_path: "/placeholder/vault",
   };
 }
+
+describe("local config: Pi root authority", () => {
+  it("defaults to disabled and accepts only an explicit boolean opt-in", () => {
+    expect(parseLocalConfig(validLocalConfig()).pi_root_authority).toBe(false);
+    expect(parseLocalConfig({
+      ...validLocalConfig(),
+      pi_root_authority: false,
+    }).pi_root_authority).toBe(false);
+    expect(parseLocalConfig({
+      ...validLocalConfig(),
+      pi_root_authority: true,
+    }).pi_root_authority).toBe(true);
+
+    for (const value of ["true", 1, 0, null, {}, []]) {
+      expect(() => parseLocalConfig({
+        ...validLocalConfig(),
+        pi_root_authority: value,
+      }), `value=${JSON.stringify(value)}`).toThrowError(ConfigError);
+    }
+  });
+
+  it("rejects authority opt-in from portable vault configuration", () => {
+    expect(() => parsePortableConfig({
+      version: 1,
+      layout: DEFAULT_LAYOUT,
+      pi_root_authority: true,
+    })).toThrowError(ConfigError);
+  });
+
+  it("loads the machine-local opt-in without touching the vault", async () => {
+    await withVault(async (ctx) => {
+      await writeLocalConfig(ctx, {
+        ...validLocalConfig(),
+        vault_path: path.join(ctx.root, "missing-vault"),
+        pi_root_authority: true,
+      });
+      const noVaultFs: ConfigFs = {
+        readFile: nodeConfigFs.readFile,
+        stat: async () => {
+          throw new Error("vault stat must not run");
+        },
+        realpath: async () => {
+          throw new Error("vault realpath must not run");
+        },
+      };
+      await expect(loadLocalConfig({
+        xdgConfigHome: ctx.xdg,
+        home: ctx.home,
+        fs: noVaultFs,
+      })).resolves.toMatchObject({ pi_root_authority: true });
+    });
+  });
+});
 
 describe("loadConfig: portable/local merge", () => {
   it("merges portable layout/templates/headings/budget/conventions with local host/vault/overrides", async () => {

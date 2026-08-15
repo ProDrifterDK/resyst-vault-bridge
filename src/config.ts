@@ -194,6 +194,7 @@ export interface LocalConfig {
   host_id: HostId;
   vault_path: string;
   project_overrides: LocalProjectOverride[];
+  pi_root_authority: boolean;
 }
 
 /** Fully validated, merged configuration returned by {@link loadConfig}. */
@@ -216,6 +217,7 @@ export interface BridgeConfig {
   budget: PortableConfig["budget"];
   conventions: PortableConfig["conventions"];
   project_overrides: LocalProjectOverride[];
+  pi_root_authority: boolean;
 }
 
 /**
@@ -320,6 +322,7 @@ const LocalConfigSchema = Type.Object(
     host_id: HostIdSchema,
     vault_path: AbsolutePathSchema,
     project_overrides: Type.Optional(Type.Array(LocalProjectOverrideSchema)),
+    pi_root_authority: Type.Optional(Type.Boolean()),
   },
   { additionalProperties: false },
 );
@@ -507,6 +510,7 @@ export function parseLocalConfig(value: unknown): LocalConfig {
       host_id: parsed.host_id,
       vault_path: parsed.vault_path,
       project_overrides: parsed.project_overrides ?? [],
+      pi_root_authority: parsed.pi_root_authority ?? false,
     };
   } catch (error) {
     if (error instanceof ConfigError) {
@@ -536,14 +540,13 @@ function narrowConfig<Shape>(
   return value as Shape;
 }
 
-export async function loadConfig(deps: LoadConfigDeps = {}): Promise<BridgeConfig> {
+export async function loadLocalConfig(deps: LoadConfigDeps = {}): Promise<LocalConfig> {
   const fs = deps.fs ?? nodeConfigFs;
   const localConfigDir = path.join(
     deps.xdgConfigHome ?? path.join(deps.home ?? homedir(), ".config"),
     "resyst-vault",
   );
   const localConfigFile = path.join(localConfigDir, "config.json");
-
   const localRaw = await readOrAbsent(fs, localConfigFile, "local_config_missing", "local_config_unreadable");
   if (Buffer.byteLength(localRaw, "utf8") > MAX_CONFIG_BYTES) {
     throw new ConfigError("local_config_invalid");
@@ -554,8 +557,12 @@ export async function loadConfig(deps: LoadConfigDeps = {}): Promise<BridgeConfi
   } catch {
     throw new ConfigError("local_config_invalid");
   }
-  const local = parseLocalConfig(localValue);
+  return parseLocalConfig(localValue);
+}
 
+export async function loadConfig(deps: LoadConfigDeps = {}): Promise<BridgeConfig> {
+  const fs = deps.fs ?? nodeConfigFs;
+  const local = await loadLocalConfig(deps);
   const vaultStat = await statOrError(fs, local.vault_path, "vault_missing", "vault_unreadable");
   if (!vaultStat.isDirectory()) {
     throw new ConfigError("vault_not_directory");
@@ -640,6 +647,7 @@ export async function loadConfig(deps: LoadConfigDeps = {}): Promise<BridgeConfi
     budget: portable.budget,
     conventions: portable.conventions,
     project_overrides: local.project_overrides,
+    pi_root_authority: local.pi_root_authority,
   };
 }
 

@@ -123,6 +123,7 @@ function config(overrides: BridgeConfig["project_overrides"] = []): BridgeConfig
     budget: { context_tokens: 5000 },
     conventions: { project_frontmatter_field: "resyst_project" },
     project_overrides: overrides,
+    pi_root_authority: false,
   };
 }
 

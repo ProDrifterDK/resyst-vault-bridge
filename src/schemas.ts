@@ -301,9 +301,14 @@ export const TargetsSchema = Type.Object(
   { additionalProperties: false },
 );
 
+export const CheckpointAgentSchema = Type.Union([
+  Type.Literal("prime-agent"),
+  Type.Literal("pi"),
+]);
+
 export const CheckpointSourceSchema = Type.Object(
   {
-    agent: Type.Literal("prime-agent"),
+    agent: CheckpointAgentSchema,
     host_id: HostIdSchema,
     session_id: SessionIdSchema,
     cwd: CwdSchema,
@@ -595,6 +600,7 @@ export const SearchHitSchema = Type.Object(
 // Derived protocol value types: single source of truth for the value
 // contract. `types.ts` re-exports these.
 // ---------------------------------------------------------------------------
+export type CheckpointAgent = StaticDecode<typeof CheckpointAgentSchema>;
 export type CheckpointSource = StaticDecode<typeof CheckpointSourceSchema>;
 export type KnowledgeItem = StaticDecode<typeof KnowledgeItemSchema>;
 export type Knowledge = StaticDecode<typeof KnowledgeSchema>;

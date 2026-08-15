@@ -61,6 +61,7 @@ the absolute vault path.
   "version": 1,
   "host_id": "casey",
   "vault_path": "/home/tester/Notes",
+  "pi_root_authority": false,
   "project_overrides": [
     {
       "path": "/home/tester/atlas",
@@ -80,6 +81,10 @@ Rules enforced by the loader:
 - `project_overrides` are exact machine-local maps from a real path to a
   portable project id. They take precedence over portable resolution for
   the listed paths only.
+- `pi_root_authority` is optional and defaults to `false`. Only literal boolean
+  `true` opts standalone Pi sessions into bootstrap and checkpoint authority;
+  positively marked Pi subagents remain read-only. The portable YAML cannot
+  set this field.
 - The same secret/hook rejection rules apply as for the portable file.
 
 ## Resolution order
@@ -91,6 +96,7 @@ The loader merges the two files; keys are owned by exactly one source:
 | `vault_path`              |               |     ✓      |
 | `host_id`                 |               |     ✓      |
 | `project_overrides`       |               |     ✓      |
+| `pi_root_authority`       |               |     ✓      |
 | `layout.*`                |       ✓       |            |
 | `templates.daily`         |       ✓       |            |
 | `managed_headings.*`      |       ✓       |            |
@@ -135,7 +141,8 @@ the CLI integration tests is:
   "version": 1,
   "host_id": "casey",
   "vault_path": "<tmp-vault>",
-  "project_overrides": []
+  "project_overrides": [],
+  "pi_root_authority": false
 }
 ```
 

@@ -14,6 +14,8 @@
  * the moment the leader settles.
  */
 import { createHash } from "node:crypto";
+import path from "node:path";
+import { CwdSchema, SessionIdSchema, parseWithSchema, } from "../schemas.js";
 const MAX_SESSION_ID_LENGTH = 1024;
 const MAX_PROMPT_LENGTH = 65_536;
 const MAX_SAFE_DEPTH = Number.MAX_SAFE_INTEGER;
@@ -75,6 +77,87 @@ export function authorityFromHeader(header) {
         depth: depthValue,
         is_root: depthValue === 0,
     };
+}
+function readEnvMarker(env, key) {
+    if (env === null || typeof env !== "object")
+        return null;
+    try {
+        const value = env[key];
+        if (value === undefined)
+            return undefined;
+        return typeof value === "string" ? value : null;
+    }
+    catch {
+        return null;
+    }
+}
+function parsePiDepth(value) {
+    if (value === null)
+        return null;
+    if (value === undefined)
+        return 0;
+    if (value.length === 0 || value.length > 16 || !/^(0|[1-9][0-9]*)$/u.test(value)) {
+        return null;
+    }
+    const depth = Number(value);
+    return Number.isSafeInteger(depth) ? depth : null;
+}
+export function classifyPiMarkers(env) {
+    const child = readEnvMarker(env, "PI_SUBAGENT_CHILD");
+    const rawDepth = readEnvMarker(env, "PI_SUBAGENT_DEPTH");
+    const depth = parsePiDepth(rawDepth);
+    if (child === null || depth === null)
+        return "unavailable";
+    if (child !== undefined && child !== "1")
+        return "unavailable";
+    if (child === "1") {
+        if (rawDepth === undefined)
+            return "child";
+        return depth === 0 ? "unavailable" : "child";
+    }
+    return depth === 0 ? "root_candidate" : "child";
+}
+export function safeAbsoluteCwd(value) {
+    if (typeof value !== "string" || value.length === 0 || value.length > 4096)
+        return null;
+    if (!path.isAbsolute(value) || Buffer.byteLength(value, "utf8") > 4096)
+        return null;
+    try {
+        return parseWithSchema(CwdSchema, value, "host cwd");
+    }
+    catch {
+        return null;
+    }
+}
+function validatedSessionId(value) {
+    if (value === null)
+        return null;
+    try {
+        return parseWithSchema(SessionIdSchema, value, "host session id");
+    }
+    catch {
+        return null;
+    }
+}
+export function resolveHostAuthority(input) {
+    const markers = classifyPiMarkers(input.env);
+    if (markers !== "root_candidate") {
+        return { kind: markers, session_id: null, agent: null };
+    }
+    const prime = authorityFromHeader(input.header);
+    const sessionId = validatedSessionId(prime.session_id);
+    if (sessionId === null) {
+        return { kind: "unavailable", session_id: null, agent: null };
+    }
+    if (prime.depth !== null) {
+        return prime.is_root && safeAbsoluteCwd(input.cwd) !== null
+            ? { kind: "root", session_id: sessionId, agent: "prime-agent" }
+            : { kind: "child", session_id: sessionId, agent: null };
+    }
+    if (!input.piRootAuthority || safeAbsoluteCwd(input.cwd) === null) {
+        return { kind: "unavailable", session_id: sessionId, agent: null };
+    }
+    return { kind: "root", session_id: sessionId, agent: "pi" };
 }
 const WHITESPACE_PATTERN = /[\s\u2028\u2029]+/gu;
 /**

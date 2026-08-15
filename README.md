@@ -16,8 +16,9 @@ being validated with synthetic fixtures; production rollout remains disabled.
   bounded snapshot/search/read services, and pure checkpoint planning.
 - **Safe mutation:** local locks, precondition hashes, backups, immutable
   journals and receipts, durable recovery, idempotent replay, and rollback.
-- **Thin adapters:** Prime Agent loads bounded provenance-bearing context and
-  exposes universal read tools; only an authoritative root gets checkpoint
+- **Thin adapters:** Prime Agent and explicitly opted-in Pi roots load bounded
+  provenance-bearing context and expose universal read tools; positively marked
+  subagents remain read-only and only an authoritative root gets checkpoint
   authority. Other agent adapters remain future work.
 - **Split control plane:** portable layout plus immutable journal and receipt
   records live under the vault's `.resyst/` tree. Host identity, locks, caches,
@@ -32,7 +33,7 @@ and
 
 Implemented: configuration and containment, bounded snapshots, bootstrap,
 resolution, read/search, rendering, transactional apply/recovery/rollback, the
-JSON CLI, Prime bootstrap/read/checkpoint integration, and automatic
+JSON CLI, Prime and Pi bootstrap/read/checkpoint integration, and automatic
 missing-checkpoint evaluation, CI, and public-repository privacy gates. The
 final synthetic canary and offline Prime compatibility smoke are implemented and remain mandatory release gates.
 
@@ -42,11 +43,16 @@ Git installation is the current canary path; this is not an npm release.
 ## Install from Git for synthetic testing
 
 ```bash
-pi package install git:github.com/ProDrifterDK/resyst-vault-bridge
+prime-agent package install git:github.com/ProDrifterDK/resyst-vault-bridge
+pi install git:github.com/ProDrifterDK/resyst-vault-bridge
 ```
 
-Prime Agent installs dependencies and loads the tracked built extension entry. The adapter requires a host that persists a safe integer `SessionHeader.rlmDepth`; Prime Agent v0.7.2 is the pinned full-authority canary. Hosts without that capability remain read-only and receive no automatic bootstrap. See
-[`docs/prime-agent.md`](docs/prime-agent.md) for adapter setup.
+Both hosts install dependencies and load the tracked built extension entry.
+Prime Agent v0.7.2 uses persisted safe-integer `SessionHeader.rlmDepth` authority.
+Pi remains read-only unless its machine-local config explicitly sets
+`pi_root_authority: true`; `PI_SUBAGENT_CHILD` and `PI_SUBAGENT_DEPTH` markers
+can only remove that authority. See [`docs/prime-agent.md`](docs/prime-agent.md)
+and [`docs/pi.md`](docs/pi.md) for adapter setup.
 
 ## Synthetic CLI examples
 

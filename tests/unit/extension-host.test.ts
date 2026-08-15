@@ -4,7 +4,9 @@ import {
   MAX_CACHE_KEYS,
   MAX_IN_FLIGHT_LOADS,
   authorityFromHeader,
+  classifyPiMarkers,
   promptFingerprint,
+  resolveHostAuthority,
   safeReadStringProperty,
 } from "../../src/extension/host.js";
 
@@ -74,6 +76,70 @@ describe("Prime host authority", () => {
       depth: null,
       is_root: false,
     });
+  });
+});
+
+describe("host authority adapter", () => {
+  const header = { id: "session-atlas" };
+  const cwd = "/home/tester/atlas";
+
+  it("keeps Prime roots and children while letting Pi child markers revoke authority", () => {
+    expect(resolveHostAuthority({
+      header: { ...header, rlmDepth: 0 }, cwd, piRootAuthority: false, env: {},
+    })).toMatchObject({ kind: "root", agent: "prime-agent" });
+    expect(resolveHostAuthority({
+      header: { ...header, rlmDepth: 2 }, cwd, piRootAuthority: true, env: {},
+    })).toMatchObject({ kind: "child", agent: null });
+    expect(resolveHostAuthority({
+      header: { ...header, rlmDepth: 0 }, cwd, piRootAuthority: true,
+      env: { PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_DEPTH: "1" },
+    })).toMatchObject({ kind: "child", agent: null });
+  });
+
+  it("requires explicit Pi opt-in and valid root context", () => {
+    expect(resolveHostAuthority({
+      header, cwd, piRootAuthority: false, env: {},
+    }).kind).toBe("unavailable");
+    expect(resolveHostAuthority({
+      header, cwd, piRootAuthority: true, env: {},
+    })).toEqual({ kind: "root", session_id: "session-atlas", agent: "pi" });
+    expect(resolveHostAuthority({
+      header: { id: "" }, cwd, piRootAuthority: true, env: {},
+    }).kind).toBe("unavailable");
+    expect(resolveHostAuthority({
+      header, cwd: "relative/path", piRootAuthority: true, env: {},
+    }).kind).toBe("unavailable");
+  });
+
+  it("parses Pi child markers with a strict fail-closed grammar", () => {
+    expect(classifyPiMarkers({})).toBe("root_candidate");
+    expect(classifyPiMarkers({ PI_SUBAGENT_DEPTH: "0" })).toBe("root_candidate");
+    expect(classifyPiMarkers({ PI_SUBAGENT_CHILD: "1" })).toBe("child");
+    expect(classifyPiMarkers({ PI_SUBAGENT_DEPTH: "2" })).toBe("child");
+    expect(classifyPiMarkers({
+      PI_SUBAGENT_CHILD: "1",
+      PI_SUBAGENT_DEPTH: "2",
+    })).toBe("child");
+    expect(classifyPiMarkers({
+      PI_SUBAGENT_CHILD: "1",
+      PI_SUBAGENT_DEPTH: "0",
+    })).toBe("unavailable");
+
+    for (const value of ["", "0", "true", "01", "undefined", " 1", "1 "]) {
+      expect(classifyPiMarkers({ PI_SUBAGENT_CHILD: value }), `child=${JSON.stringify(value)}`).toBe("unavailable");
+    }
+    for (const value of ["", "-0", "00", "01", "+1", "1.0", "1e0", "0x1", " 1", "1 ", "-1", "9007199254740992", "١"]) {
+      expect(classifyPiMarkers({ PI_SUBAGENT_DEPTH: value }), `depth=${JSON.stringify(value)}`).toBe("unavailable");
+    }
+  });
+
+  it("ignores the parent-session marker because Pi sets it in parent and child", () => {
+    expect(resolveHostAuthority({
+      header,
+      cwd,
+      piRootAuthority: true,
+      env: { PI_SUBAGENT_PARENT_SESSION: "parent-session" },
+    })).toEqual({ kind: "root", session_id: "session-atlas", agent: "pi" });
   });
 });
 

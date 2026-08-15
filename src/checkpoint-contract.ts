@@ -5,6 +5,7 @@ import {
   EvidenceItemSchema,
   TargetsSchema,
   VersionSchema,
+  type CheckpointAgent,
 } from "./schemas.js";
 
 const MAX_CHECKPOINT_ITEMS = 32;
@@ -103,7 +104,11 @@ export const CHECKPOINT_OUTCOMES = [
 ] as const;
 export type CheckpointOutcome = (typeof CHECKPOINT_OUTCOMES)[number];
 export interface CheckpointResult { outcome: CheckpointOutcome; }
-export interface CheckpointTrustedInput { cwd: string; session_id: string; }
+export interface CheckpointTrustedInput {
+  cwd: string;
+  session_id: string;
+  agent?: CheckpointAgent;
+}
 export interface CheckpointService {
   checkpoint(input: {
     command: CheckpointCommand;

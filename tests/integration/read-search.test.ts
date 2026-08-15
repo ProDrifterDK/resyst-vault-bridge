@@ -37,6 +37,7 @@ async function fixtureConfig(root: string): Promise<BridgeConfig> {
     budget: { context_tokens: 5_000 },
     conventions: { project_frontmatter_field: "resyst_project" },
     project_overrides: [],
+    pi_root_authority: false,
   };
 }
 

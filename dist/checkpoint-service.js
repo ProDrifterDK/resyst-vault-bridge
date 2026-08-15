@@ -10,7 +10,7 @@ import { parseNote } from "./markdown.js";
 import { VaultPathError, VaultPaths, nodeVaultPathsFs } from "./paths.js";
 import { buildAssociationProposal, resolveProjectWithCandidates, } from "./project.js";
 import { buildWritePlans } from "./render.js";
-import { CwdSchema, EventIdSchema, HashHexSchema, IdempotencyKeySchema, IsoTimestampSchema, ProjectResolutionSchema, SessionIdSchema, VaultPathSchema, parseWithSchema, } from "./schemas.js";
+import { CheckpointAgentSchema, CwdSchema, EventIdSchema, HashHexSchema, IdempotencyKeySchema, IsoTimestampSchema, ProjectResolutionSchema, SessionIdSchema, VaultPathSchema, parseWithSchema, } from "./schemas.js";
 import { nodeSnapshotFs, readSnapshotFile, } from "./snapshot.js";
 import { MissingProgressError, TransactionService } from "./transaction.js";
 import { CheckpointCommandSchema, } from "./checkpoint-contract.js";
@@ -18,7 +18,11 @@ const MAX_SNAPSHOT_BYTES = 1_000_000;
 const MOC_RELATIVE_PATH = "MOC — Inicio.md";
 const CLAUDE_RELATIVE_PATH = "CLAUDE.md";
 const UNRESOLVED_PROJECT_ID = "unresolved";
-const TrustedCheckpointContextSchema = Type.Object({ cwd: CwdSchema, session_id: SessionIdSchema }, { additionalProperties: false });
+const TrustedCheckpointContextSchema = Type.Object({
+    cwd: CwdSchema,
+    session_id: SessionIdSchema,
+    agent: Type.Optional(CheckpointAgentSchema),
+}, { additionalProperties: false });
 function validateTrusted(value) {
     const parsed = parseWithSchema(TrustedCheckpointContextSchema, value, "trusted checkpoint context");
     if (!path.isAbsolute(parsed.cwd) || Buffer.byteLength(parsed.cwd, "utf8") > 4_096) {
@@ -197,7 +201,7 @@ async function checkpointOnce(input, deps) {
     });
     const resolution = parseWithSchema(ProjectResolutionSchema, resolutionOutcome.resolution, "checkpoint project resolution");
     const source = {
-        agent: "prime-agent",
+        agent: trusted.agent ?? "prime-agent",
         host_id: config.host_id,
         session_id: trusted.session_id,
         cwd: trusted.cwd,

@@ -91,9 +91,9 @@ describe("stable JSON CLI", () => {
   it("handles SIGINT without prompts or partial stdout", async () => {
     const child = spawn(process.execPath, [cli, "search"], { cwd: path.resolve("."), env: environment, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = ""; child.stdout.setEncoding("utf8"); child.stdout.on("data", (chunk: string) => { stdout += chunk; });
-    // Wait long enough for Node ESM module loading and the top-level SIGINT
-    // handler registration to complete before delivering the signal.
-    await new Promise<void>((resolve) => setTimeout(resolve, 300)); child.kill("SIGINT");
+    // Low-memory single-worker CI can make Node ESM startup noticeably slower;
+    // wait for the top-level SIGINT handler before delivering the signal.
+    await new Promise<void>((resolve) => setTimeout(resolve, 1_500)); child.kill("SIGINT");
     const code = await new Promise<number | null>((resolve) => child.on("close", resolve));
     expect(code).toBe(130); expect(stdout).toBe("");
   });

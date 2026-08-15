@@ -41,6 +41,12 @@ The bridge defends against:
   could carry credentials, tokens, passwords, authorization fields, or
   executable hooks. Any match is a hard rejection with a fixed redacted
   message.
+- **Host authority confusion.** Prime Agent uses persisted `rlmDepth`; Pi uses
+  an explicit machine-local opt-in. Exact Pi child/depth markers are parsed
+  with a strict grammar before either host adapter, so a positive child signal
+  can only remove authority. Malformed or contradictory markers fail closed,
+  and mid-session marker revocation is permanent until a normal lifecycle
+  restart.
 
 The bridge does not defend against:
 
@@ -53,6 +59,9 @@ The bridge does not defend against:
   `~/.local/state/resyst-vault/`. Those files are protected by the
   filesystem permissions of the host account, not by an additional
   cryptographic layer.
+- A child process that has an independent shell or filesystem-write capability.
+  Root/child authority constrains the bridge interface; it is not a local-user
+  sandbox.
 
 ## Privacy boundary
 

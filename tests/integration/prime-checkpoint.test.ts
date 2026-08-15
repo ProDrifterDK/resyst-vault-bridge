@@ -185,6 +185,97 @@ describe("Prime root checkpoint integration", () => {
     }
   });
 
+  it("grants opted-in Pi roots, records Pi provenance, and never grants children", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "resyst-pi-checkpoint-authority-"));
+    try {
+      const env: Record<string, string | undefined> = {};
+      const run = vi.fn(async () => ({ outcome: "noop" as const }));
+      const bootstrap = vi.fn(async () => "PI CONTEXT");
+      const rootHarness = harness();
+      await install(root, rootHarness, { checkpoint: run }, {
+        authorityEnv: env,
+        loadPiRootAuthority: async () => true,
+        service: { ...fakeReadService(), bootstrap },
+      });
+      const rootCtx = context({ id: "session-pi" });
+      await emit(rootHarness, "session_start", { type: "session_start", reason: "startup" }, rootCtx);
+      expect(rootHarness.api.getActiveTools()).toContain("vault_checkpoint");
+      await expect(checkpointTool(rootHarness).execute(
+        "pi-noop",
+        noopCommand(),
+        undefined,
+        undefined,
+        rootCtx,
+      )).resolves.toMatchObject({ details: { outcome: "noop" } });
+      expect(run).toHaveBeenCalledWith({
+        command: noopCommand(),
+        trusted: {
+          agent: "pi",
+          cwd: "/home/tester/atlas",
+          session_id: "session-pi",
+        },
+      });
+      const [bootstrapResult] = await emit(rootHarness, "before_agent_start", {
+        type: "before_agent_start",
+        prompt: "status",
+        systemPrompt: "BASE",
+      }, rootCtx);
+      expect(bootstrapResult).toMatchObject({ systemPrompt: expect.stringContaining("PI CONTEXT") });
+
+      env.PI_SUBAGENT_CHILD = "1";
+      const revoked = await checkpointTool(rootHarness).execute(
+        "pi-revoked",
+        noopCommand(),
+        undefined,
+        undefined,
+        rootCtx,
+      );
+      expect(revoked).toMatchObject({ details: { outcome: "unavailable" } });
+      expect(run).toHaveBeenCalledTimes(1);
+      expect((await emit(rootHarness, "before_agent_start", {
+        type: "before_agent_start",
+        prompt: "after revoke",
+        systemPrompt: "BASE",
+      }, rootCtx))[0]).toBeUndefined();
+      delete env.PI_SUBAGENT_CHILD;
+      const stillRevoked = await checkpointTool(rootHarness).execute(
+        "pi-still-revoked",
+        noopCommand(),
+        undefined,
+        undefined,
+        rootCtx,
+      );
+      expect(stillRevoked).toMatchObject({ details: { outcome: "unavailable" } });
+      expect((await emit(rootHarness, "before_agent_start", {
+        type: "before_agent_start",
+        prompt: "cannot restore",
+        systemPrompt: "BASE",
+      }, rootCtx))[0]).toBeUndefined();
+
+      const childEnv: Record<string, string | undefined> = {
+        PI_SUBAGENT_CHILD: "1",
+        PI_SUBAGENT_DEPTH: "1",
+      };
+      const childHarness = harness();
+      await install(root, childHarness, { checkpoint: run }, {
+        authorityEnv: childEnv,
+        loadPiRootAuthority: async () => true,
+      });
+      const childCtx = context({ id: "session-child" });
+      await emit(childHarness, "session_start", { type: "session_start", reason: "startup" }, childCtx);
+      delete childEnv.PI_SUBAGENT_CHILD;
+      delete childEnv.PI_SUBAGENT_DEPTH;
+      expect(childHarness.tools.some((tool) => tool.name === "vault_checkpoint")).toBe(false);
+      expect((await emit(childHarness, "before_agent_start", {
+        type: "before_agent_start",
+        prompt: "cannot promote",
+        systemPrompt: "BASE",
+      }, childCtx))[0]).toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("keeps the root checkpoint authoritative after the same factory starts a child", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "resyst-prime-checkpoint-isolation-"));
     try {
@@ -270,7 +361,11 @@ describe("Prime root checkpoint integration", () => {
       expect(run).toHaveBeenCalledOnce();
       expect(run).toHaveBeenCalledWith({
         command: noopCommand(),
-        trusted: { cwd: "/home/tester/atlas", session_id: "session-atlas" },
+        trusted: {
+          agent: "prime-agent",
+          cwd: "/home/tester/atlas",
+          session_id: "session-atlas",
+        },
       });
       expect(result.content).toEqual([{ type: "text", text: "vault checkpoint: noop" }]);
       expect(result.details).toEqual({ version: 1, outcome: "noop" });
@@ -633,6 +728,25 @@ describe("Prime root checkpoint integration", () => {
       expect(sessionMarkers).toHaveLength(4);
       expect(new Set(sessionMarkers).size).toBe(4);
 
+      await expect(service.checkpoint({
+        command: applyCommand(),
+        trusted: { agent: "pi", cwd: root, session_id: "session-pi" },
+      })).resolves.toEqual({ outcome: "applied" });
+      const journalAfterPi = await import("node:fs/promises").then((fs) =>
+        fs.readdir(vault.paths.journalDir, { recursive: true }),
+      );
+      const durableAgents = await Promise.all(
+        journalAfterPi
+          .filter((name) => String(name).endsWith(".json"))
+          .map(async (name) => {
+            const parsed = JSON.parse(
+              await readFile(path.join(vault.paths.journalDir, String(name)), "utf8"),
+            ) as { checkpoint?: { source?: { agent?: unknown } } };
+            return parsed.checkpoint?.source?.agent;
+          }),
+      );
+      expect(durableAgents).toContain("pi");
+
       const config = await loadConfig({ xdgConfigHome: configHome });
       const crashJournal = new JournalStore({
         vaultRoot: config.vault_path,
@@ -693,8 +807,8 @@ describe("Prime root checkpoint integration", () => {
       const receiptsAfterNoop = await import("node:fs/promises").then((fs) =>
         fs.readdir(vault.paths.receiptsDir, { recursive: true }),
       );
-      expect(journalAfterNoop.filter((name) => String(name).endsWith(".json"))).toHaveLength(4);
-      expect(receiptsAfterNoop.filter((name) => String(name).endsWith(".json"))).toHaveLength(4);
+      expect(journalAfterNoop.filter((name) => String(name).endsWith(".json"))).toHaveLength(5);
+      expect(receiptsAfterNoop.filter((name) => String(name).endsWith(".json"))).toHaveLength(5);
       await expect(
         service.checkpoint({
           command: noopCommand(),
@@ -704,7 +818,7 @@ describe("Prime root checkpoint integration", () => {
       const receiptAfterRetry = await import("node:fs/promises").then((fs) =>
         fs.readdir(vault.paths.receiptsDir, { recursive: true }),
       );
-      expect(receiptAfterRetry.filter((name) => String(name).endsWith(".json"))).toHaveLength(4);
+      expect(receiptAfterRetry.filter((name) => String(name).endsWith(".json"))).toHaveLength(5);
 
       await expect(Promise.all([
         service.checkpoint({ command: noopCommand(), trusted: { cwd: root, session_id: "session-race" } }),
@@ -713,7 +827,7 @@ describe("Prime root checkpoint integration", () => {
       const receiptsAfterRace = await import("node:fs/promises").then((fs) =>
         fs.readdir(vault.paths.receiptsDir, { recursive: true }),
       );
-      expect(receiptsAfterRace.filter((name) => String(name).endsWith(".json"))).toHaveLength(5);
+      expect(receiptsAfterRace.filter((name) => String(name).endsWith(".json"))).toHaveLength(6);
 
       await expect(
         service.checkpoint({
@@ -726,7 +840,7 @@ describe("Prime root checkpoint integration", () => {
       );
       expect(
         journalAfterOtherSession.filter((name) => String(name).endsWith(".json")),
-      ).toHaveLength(6);
+      ).toHaveLength(7);
 
       const projectBefore = await readFile(vault.absolute("Proyectos/Atlas.md"), "utf8");
       const unresolvedCwd = path.join(root, "unmatched");

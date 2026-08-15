@@ -154,6 +154,7 @@ const LocalConfigSchema = Type.Object({
     host_id: HostIdSchema,
     vault_path: AbsolutePathSchema,
     project_overrides: Type.Optional(Type.Array(LocalProjectOverrideSchema)),
+    pi_root_authority: Type.Optional(Type.Boolean()),
 }, { additionalProperties: false });
 /**
  * Key names that would carry credentials or authorization material. Matching
@@ -307,6 +308,7 @@ export function parseLocalConfig(value) {
             host_id: parsed.host_id,
             vault_path: parsed.vault_path,
             project_overrides: parsed.project_overrides ?? [],
+            pi_root_authority: parsed.pi_root_authority ?? false,
         };
     }
     catch (error) {
@@ -329,7 +331,7 @@ function narrowConfig(value, schema, source) {
     }
     return value;
 }
-export async function loadConfig(deps = {}) {
+export async function loadLocalConfig(deps = {}) {
     const fs = deps.fs ?? nodeConfigFs;
     const localConfigDir = path.join(deps.xdgConfigHome ?? path.join(deps.home ?? homedir(), ".config"), "resyst-vault");
     const localConfigFile = path.join(localConfigDir, "config.json");
@@ -344,7 +346,11 @@ export async function loadConfig(deps = {}) {
     catch {
         throw new ConfigError("local_config_invalid");
     }
-    const local = parseLocalConfig(localValue);
+    return parseLocalConfig(localValue);
+}
+export async function loadConfig(deps = {}) {
+    const fs = deps.fs ?? nodeConfigFs;
+    const local = await loadLocalConfig(deps);
     const vaultStat = await statOrError(fs, local.vault_path, "vault_missing", "vault_unreadable");
     if (!vaultStat.isDirectory()) {
         throw new ConfigError("vault_not_directory");
@@ -430,6 +436,7 @@ export async function loadConfig(deps = {}) {
         budget: portable.budget,
         conventions: portable.conventions,
         project_overrides: local.project_overrides,
+        pi_root_authority: local.pi_root_authority,
     };
 }
 /** Read a file, mapping only ENOENT to absence; every other failure is hard. */

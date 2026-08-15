@@ -18,6 +18,7 @@ import {
 } from "./project.js";
 import { buildWritePlans, type RenderSnapshots, type WritePlan } from "./render.js";
 import {
+  CheckpointAgentSchema,
   CwdSchema,
   EventIdSchema,
   HashHexSchema,
@@ -27,6 +28,7 @@ import {
   SessionIdSchema,
   VaultPathSchema,
   parseWithSchema,
+  type CheckpointAgent,
 } from "./schemas.js";
 import {
   nodeSnapshotFs,
@@ -61,7 +63,11 @@ const CLAUDE_RELATIVE_PATH = "CLAUDE.md";
 const UNRESOLVED_PROJECT_ID = "unresolved";
 
 const TrustedCheckpointContextSchema = Type.Object(
-  { cwd: CwdSchema, session_id: SessionIdSchema },
+  {
+    cwd: CwdSchema,
+    session_id: SessionIdSchema,
+    agent: Type.Optional(CheckpointAgentSchema),
+  },
   { additionalProperties: false },
 );
 
@@ -80,7 +86,7 @@ export interface ProductionCheckpointServiceDeps {
   transaction?: TransactionService;
 }
 
-function validateTrusted(value: unknown): { cwd: string; session_id: string } {
+function validateTrusted(value: unknown): { cwd: string; session_id: string; agent?: CheckpointAgent } {
   const parsed = parseWithSchema(TrustedCheckpointContextSchema, value, "trusted checkpoint context");
   if (!path.isAbsolute(parsed.cwd) || Buffer.byteLength(parsed.cwd, "utf8") > 4_096) {
     throw new Error("trusted checkpoint context is invalid");
@@ -316,7 +322,7 @@ async function checkpointOnce(
     "checkpoint project resolution",
   );
   const source: CheckpointSource = {
-    agent: "prime-agent",
+    agent: trusted.agent ?? "prime-agent",
     host_id: config.host_id,
     session_id: trusted.session_id as SessionId,
     cwd: trusted.cwd,

@@ -283,6 +283,19 @@ describe("parseCheckpoint", () => {
     }
   });
 
+  it("accepts Prime and Pi checkpoint provenance but rejects unknown agents", () => {
+    const pi = validApply();
+    (pi.source as Record<string, unknown>).agent = "pi";
+    expect(parseCheckpoint(pi)).toMatchObject({
+      kind: "apply",
+      source: { agent: "pi" },
+    });
+
+    const unknown = validApply();
+    (unknown.source as Record<string, unknown>).agent = "other-agent";
+    expect(() => parseCheckpoint(unknown)).toThrowError(SchemaValidationError);
+  });
+
   it("accepts a valid noop checkpoint for every documented reason", () => {
     const reasons = [
       "trivial",

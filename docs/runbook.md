@@ -21,7 +21,10 @@ recorded or if any prior gate is not green.
    dependencies into `node_modules/.cache`; verify the commit before proceeding.
    The subsequent Git-package install and extension exercise are offline. All
    runtime probes operate only on generated temporary Casey/Atlas vaults and
-   must not contact a model provider.
+   must not contact a model provider. For Pi, also verify an unopted session is
+   read-only, an opted-in synthetic root receives bootstrap/checkpoint authority,
+   and foreground/background child processes keep exact child markers and remain
+   read-only.
 3. Against the real vault, run only `doctor`, `status`, `search`, and `read`.
    Do not enable checkpoints or automatic evaluation.
 4. Prepare one bounded checkpoint request and run `resyst-vault checkpoint

@@ -187,8 +187,12 @@ export const TargetsSchema = Type.Object({
     project: Type.Boolean(),
     landscape: Type.Boolean(),
 }, { additionalProperties: false });
+export const CheckpointAgentSchema = Type.Union([
+    Type.Literal("prime-agent"),
+    Type.Literal("pi"),
+]);
 export const CheckpointSourceSchema = Type.Object({
-    agent: Type.Literal("prime-agent"),
+    agent: CheckpointAgentSchema,
     host_id: HostIdSchema,
     session_id: SessionIdSchema,
     cwd: CwdSchema,

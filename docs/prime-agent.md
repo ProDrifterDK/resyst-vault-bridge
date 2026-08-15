@@ -9,7 +9,7 @@ sessions never keep it active.
 
 ## Installation
 
-Prime Agent loads extensions from Git packages. Full root behavior requires an authenticated host capability: a persisted safe-integer `SessionHeader.rlmDepth` that round-trips through `SessionManager.newSession`. The release gate pins Prime Agent v0.7.2 at immutable commit `83a0f9f9566219551fcb6ffaf7f519a815749a58`, which includes that contract. The legacy npm SDK 0.84.1 supplies the compile-time API baseline but does not persist depth; it is tested only to fail closed with read tools, no bootstrap, and no checkpoint authority.
+Prime Agent loads extensions from Git packages. Full root behavior requires an authenticated host capability: a persisted safe-integer `SessionHeader.rlmDepth` that round-trips through `SessionManager.newSession`. The release gate pins Prime Agent v0.7.2 at immutable commit `83a0f9f9566219551fcb6ffaf7f519a815749a58`, which includes that contract. The legacy npm SDK 0.84.1 supplies the compile-time API baseline but does not persist depth; without the separate machine-local Pi opt-in it is tested to fail closed with read tools, no bootstrap, and no checkpoint authority. See [`pi.md`](pi.md) for that adapter.
 
 Install the bridge from this repository:
 

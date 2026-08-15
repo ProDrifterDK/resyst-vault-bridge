@@ -27,7 +27,7 @@ async function context(): Promise<{ root: string; stateRoot: string; config: Bri
   const stateRoot = `${root}-state`; roots.push(stateRoot); await mkdir(stateRoot, { recursive: true });
   const config: BridgeConfig = { version: 1, host_id: "casey" as HostId, vault_path: root, vault_identity: identity,
     layout: { daily_dir: "Notas Diarias", projects_dir: "Proyectos", inbox_dir: "Inbox", templates_dir: "_plantillas", attachments_dir: "_adjuntos" },
-    templates: { daily: "_plantillas/Daily Note.md" }, managed_headings: { tareas: "## Tareas", reflexion: "## Reflexión", notas: "## Notas", enlaces: "## Enlaces del día" }, budget: { context_tokens: 5000 }, conventions: { project_frontmatter_field: "resyst_project" }, project_overrides: [] };
+    templates: { daily: "_plantillas/Daily Note.md" }, managed_headings: { tareas: "## Tareas", reflexion: "## Reflexión", notas: "## Notas", enlaces: "## Enlaces del día" }, budget: { context_tokens: 5000 }, conventions: { project_frontmatter_field: "resyst_project" }, project_overrides: [], pi_root_authority: false };
   const journal = new JournalStore({ vaultRoot: root, identity, now: () => "2026-08-11T13:00:00.000Z" });
   return { root, stateRoot, config, identity, journal, paths: new VaultPaths(root, { identity }) };
 }
