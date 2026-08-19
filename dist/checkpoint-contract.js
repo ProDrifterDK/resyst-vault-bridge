@@ -52,17 +52,29 @@ export const CheckpointCommandSchema = Type.Union([
  */
 export const CheckpointToolParametersSchema = Type.Object({
     version: VersionSchema,
-    kind: Type.Union([Type.Literal("noop"), Type.Literal("apply")]),
+    kind: Type.Union([Type.Literal("noop"), Type.Literal("apply")], {
+        description: "'noop' records that no checkpoint is needed (requires reason). 'apply' persists an evaluation (requires knowledge, evidence, targets).",
+    }),
     reason: Type.Optional(Type.Union([
         Type.Literal("trivial"),
         Type.Literal("lookup_only"),
         Type.Literal("no_new_knowledge"),
         Type.Literal("unverified"),
         Type.Literal("already_recorded"),
-    ])),
-    knowledge: Type.Optional(BoundedKnowledgeSchema),
-    evidence: Type.Optional(BoundedEvidenceSchema),
-    targets: Type.Optional(TargetsSchema),
+    ], { description: "Required when kind='noop'; omit when kind='apply'.",
+    })),
+    knowledge: Type.Optional({
+        ...BoundedKnowledgeSchema,
+        description: "Required when kind='apply'. All six keys are required arrays of {text, evidence: string[]}: completed_tasks, decisions, status_changes, blockers, reusable_learnings, next_steps. Use [] when empty. evidence entries reference evidence ids.",
+    }),
+    evidence: Type.Optional({
+        ...BoundedEvidenceSchema,
+        description: "Required when kind='apply'. All five keys are required arrays of {id, value}: commits, tests, files, deployments, observations. Use [] when empty. Ids are referenced from knowledge items.",
+    }),
+    targets: Type.Optional({
+        ...TargetsSchema,
+        description: "Required when kind='apply'. All three booleans required: daily (daily note), project (project note), landscape (landscape note).",
+    }),
 }, { additionalProperties: false });
 export const CHECKPOINT_OUTCOMES = [
     "invalid",
