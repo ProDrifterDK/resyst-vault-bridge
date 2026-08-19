@@ -176,7 +176,10 @@ describe("Prime root checkpoint integration", () => {
         { id: "session-child", rlmDepth: -1 },
       ]) {
         const childHarness = harness();
-        await install(root, childHarness, service);
+        await install(root, childHarness, service, {
+          authorityEnv: {},
+          loadPiRootAuthority: async () => false,
+        });
         await emit(childHarness, "session_start", { type: "session_start", reason: "startup" }, context(header));
         expect(childHarness.tools.some((tool) => tool.name === "vault_checkpoint")).toBe(false);
       }
