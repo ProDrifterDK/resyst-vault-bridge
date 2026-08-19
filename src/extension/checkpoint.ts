@@ -4,6 +4,7 @@ import { Type } from "typebox";
 import {
   CHECKPOINT_OUTCOMES,
   CheckpointCommandSchema,
+  CheckpointToolParametersSchema,
   type CheckpointCommand,
   type CheckpointOutcome,
   type CheckpointResult,
@@ -36,13 +37,13 @@ export interface CheckpointToolDetails {
   version: 1;
   outcome: "unavailable" | CheckpointOutcome;
 }
-export type CheckpointTool = ToolDefinition<typeof CheckpointCommandSchema, CheckpointToolDetails>;
+export type CheckpointTool = ToolDefinition<typeof CheckpointToolParametersSchema, CheckpointToolDetails>;
 export function checkpointToolDefinition(execute: CheckpointTool["execute"]): CheckpointTool {
   return {
     name: "vault_checkpoint",
     label: "Vault Checkpoint",
     description: "Persist one normalized evaluation of completed work using trusted root-session context.",
-    parameters: CheckpointCommandSchema,
+    parameters: CheckpointToolParametersSchema,
     executionMode: "sequential",
     execute,
   };

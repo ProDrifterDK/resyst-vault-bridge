@@ -1,5 +1,5 @@
 import { Type } from "typebox";
-import { CHECKPOINT_OUTCOMES, CheckpointCommandSchema, } from "../checkpoint-contract.js";
+import { CHECKPOINT_OUTCOMES, CheckpointCommandSchema, CheckpointToolParametersSchema, } from "../checkpoint-contract.js";
 import { parseWithSchema } from "../schemas.js";
 export { CHECKPOINT_OUTCOMES, CheckpointCommandSchema as VaultCheckpointParametersSchema, };
 const CheckpointResultSchema = Type.Object({ outcome: Type.Union(CHECKPOINT_OUTCOMES.map((outcome) => Type.Literal(outcome))) }, { additionalProperties: false });
@@ -12,7 +12,7 @@ export function checkpointToolDefinition(execute) {
         name: "vault_checkpoint",
         label: "Vault Checkpoint",
         description: "Persist one normalized evaluation of completed work using trusted root-session context.",
-        parameters: CheckpointCommandSchema,
+        parameters: CheckpointToolParametersSchema,
         executionMode: "sequential",
         execute,
     };

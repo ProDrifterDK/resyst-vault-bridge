@@ -67,6 +67,33 @@ export const CheckpointCommandSchema = Type.Union([
     { additionalProperties: false },
   ),
 ]);
+
+/**
+ * Provider-facing tool parameters. A bare `Type.Union` serializes as
+ * `{ anyOf: [...] }` with no root `type`, which DeepSeek/Console Go reject
+ * ("schema must be a JSON Schema of 'type: \"object\"'"). This flattened
+ * object is only the wire shape; strict discriminated-union validation
+ * still happens via `CheckpointCommandSchema` at execution time.
+ */
+export const CheckpointToolParametersSchema = Type.Object(
+  {
+    version: VersionSchema,
+    kind: Type.Union([Type.Literal("noop"), Type.Literal("apply")]),
+    reason: Type.Optional(
+      Type.Union([
+        Type.Literal("trivial"),
+        Type.Literal("lookup_only"),
+        Type.Literal("no_new_knowledge"),
+        Type.Literal("unverified"),
+        Type.Literal("already_recorded"),
+      ]),
+    ),
+    knowledge: Type.Optional(BoundedKnowledgeSchema),
+    evidence: Type.Optional(BoundedEvidenceSchema),
+    targets: Type.Optional(TargetsSchema),
+  },
+  { additionalProperties: false },
+);
 export type CheckpointCommand =
   | {
       version: 1;
