@@ -28,8 +28,10 @@
     "test:compat": "node tests/compat/prime-smoke.mjs"
   },
   "dependencies": {
-    "typebox": "^1.3.12",
     "yaml": "^2.9.0"
+  },
+  "peerDependencies": {
+    "typebox": "*"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.8",

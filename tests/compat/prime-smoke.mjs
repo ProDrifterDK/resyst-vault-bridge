@@ -197,7 +197,9 @@ try {
 			)
 		).stdout,
 	);
-	const tarball = path.join(packDir, packed[0].filename);
+	// npm <=11 prints an array of packs; npm 12 prints an object keyed by package name.
+	const [pack] = Array.isArray(packed) ? packed : Object.values(packed);
+	const tarball = path.join(packDir, pack.filename);
 	await mkdir(sourceRepo, { recursive: true });
 	await run("tar", ["-xzf", tarball, "--strip-components=1", "-C", sourceRepo]);
 	await copyFile(

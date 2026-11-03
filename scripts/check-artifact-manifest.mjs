@@ -93,7 +93,13 @@ try {
 			maxBuffer: 8 * 1024 * 1024,
 		},
 	);
-	const packs = JSON.parse(raw);
+	const parsed = JSON.parse(raw);
+	// npm <=11 prints an array of packs; npm 12 prints an object keyed by package name.
+	const packs = Array.isArray(parsed)
+		? parsed
+		: parsed && typeof parsed === "object"
+			? Object.values(parsed)
+			: parsed;
 	if (
 		!Array.isArray(packs) ||
 		packs.length !== 1 ||
@@ -147,7 +153,13 @@ try {
 		readFileSync(path.join(root, "package.json"), "utf8"),
 	);
 	if (packageMetadata.private !== true) fail();
-	if (packageMetadata.peerDependencies !== undefined) fail();
+	// Pi 1.x host-provided packages: peer "*" only, never a bundled runtime copy.
+	if (
+		JSON.stringify(packageMetadata.peerDependencies) !==
+		JSON.stringify({ typebox: "*" })
+	)
+		fail();
+	if (packageMetadata.dependencies?.typebox !== undefined) fail();
 	if (packageMetadata.engines?.node !== ">=22.19.0") fail();
 	if (
 		JSON.stringify(packageMetadata.pi?.extensions) !==
